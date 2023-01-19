@@ -20,6 +20,9 @@ pub mod bit8 {
         pub fn new(bits: u8) -> Self {
             Self { bits }
         }
+        pub fn masked(self, mask: u8) -> MaskedRegister8 {
+            MaskedRegister8 { reg: self, mask }
+        }
     }
 
     #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
@@ -83,6 +86,9 @@ pub mod bit8 {
         pub fn new(reg: Register8, mask: u8) -> Self {
             Self { reg, mask }
         }
+        pub fn unmasked(self) -> Register8 {
+            self.reg
+        }
     }
 
     impl RegisterRead for MaskedRegister8 {
@@ -122,10 +128,9 @@ pub mod bit8 {
 
         #[test]
         fn reg8_flag_reg() {
-            let reg = Register8::default();
-            let reg = MaskedRegister8::new(reg, 0x33).load(0x55);
+            let reg = Register8::default().masked(0x33).load(0x55);
             assert_eq!(reg.read(), 0x11);
-            let reg = MaskedRegister8::new(reg, 0x66).load(0x44);
+            let reg = reg.masked(0x66).load(0x44);
             assert_eq!(reg.read(), 0x55);
         }
     }

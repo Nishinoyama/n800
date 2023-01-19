@@ -21,10 +21,6 @@ pub trait FlagSet<F: ALUFlag>: Sized + BitwiseOps {
     }
 }
 
-pub trait FlagSetScrambled<F: ALUFlag, D>: FlagSet<F> {
-    fn scrambled(self) -> D;
-}
-
 pub trait ALUFlag: Sized + Copy {}
 
 pub mod bit8 {
@@ -108,7 +104,7 @@ pub mod bit8 {
 #[cfg(test)]
 mod tests {
     use crate::alu::bit8::FlagSetU8;
-    use crate::alu::{ALUFlag, FlagSet, FlagSetScrambled};
+    use crate::alu::{ALUFlag, FlagSet};
     use strum::IntoEnumIterator;
     use strum_macros::EnumIter;
 
@@ -129,12 +125,11 @@ mod tests {
 
     impl ALUFlag for TestFlag {}
 
-    impl FlagSetScrambled<TestFlag, u8> for FlagSetU8<TestFlag> {
-        fn scrambled(self) -> u8 {
-            self.into_flags()
-                .into_iter()
-                .fold(2, |acc, f| acc | f.into_u8())
-        }
+    fn scramble(flags: FlagSetU8<TestFlag>) -> u8 {
+        flags
+            .into_flags()
+            .into_iter()
+            .fold(2, |acc, f| acc | f.into_u8())
     }
 
     #[test]
@@ -142,10 +137,11 @@ mod tests {
         use TestFlag::*;
         assert_eq!(TestFlag::iter().collect::<Vec<_>>(), vec![Ovf, Zero]);
         let fs = FlagSetU8::default().set(Ovf).set(Zero).set(Ovf);
-        assert_eq!(fs.scrambled(), 11);
+        assert_eq!(scramble(fs), 11);
         let ft = fs.reset(Zero);
-        assert_eq!(ft.scrambled(), 10);
-        assert_eq!((fs | ft).scrambled(), 11);
-        assert_eq!((fs & ft).scrambled(), 10);
+        assert_eq!(scramble(ft), 10);
+        assert_eq!(scramble(fs | ft), 11);
+        assert_eq!(scramble(fs & ft), 10);
+        assert_eq!(scramble(!fs & ft), 2);
     }
 }

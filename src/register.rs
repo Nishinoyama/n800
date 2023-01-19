@@ -23,12 +23,12 @@ pub mod bit8 {
     }
 
     #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
-    pub struct Register8x2 {
+    pub struct Register8Pair {
         h: Register8,
         l: Register8,
     }
 
-    impl Register8x2 {
+    impl Register8Pair {
         pub fn new(h: Register8, l: Register8) -> Self {
             Self { h, l }
         }
@@ -57,7 +57,7 @@ pub mod bit8 {
         }
     }
 
-    impl RegisterRead for Register8x2 {
+    impl RegisterRead for Register8Pair {
         type Size = u16;
 
         fn read(&self) -> Self::Size {
@@ -65,7 +65,7 @@ pub mod bit8 {
         }
     }
 
-    impl RegisterLoad for Register8x2 {
+    impl RegisterLoad for Register8Pair {
         type Register = (Register8, Register8);
 
         fn load(self, bits: Self::Size) -> Self::Register {
@@ -111,9 +111,9 @@ pub mod bit8 {
             let reg = Register8::new(3);
             let reg = reg.load(13);
             assert_eq!(reg.read(), 13);
-            let reg16 = Register8x2::new(Register8::new(10), Register8::new(32));
+            let reg16 = Register8Pair::new(Register8::new(10), Register8::new(32));
             assert_eq!(reg16.read(), 2592);
-            let reg16 = Register8x2::from_tuple(reg16.load(3141));
+            let reg16 = Register8Pair::from_tuple(reg16.load(3141));
             assert_eq!(reg16.read(), 3141);
             let (h, l) = reg16.split();
             assert_eq!(h.read(), 12);

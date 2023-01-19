@@ -30,20 +30,28 @@ pub trait ALUFlag: Sized + Copy {}
 pub mod bit8 {
     use crate::alu::{ALUFlag, FlagSet};
     use crate::bits::BitwiseOps;
+    use std::marker::PhantomData;
     use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
     use strum::IntoEnumIterator;
 
-    #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
-    pub struct FlagSetU8 {
+    #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+    pub struct FlagSetU8<F> {
         bits: u8,
+        flag: PhantomData<F>,
     }
 
-    impl BitwiseOps for FlagSetU8 {
-        const ALL_ONE: Self = Self { bits: u8::MAX };
-        const ALL_ZERO: Self = Self { bits: u8::MIN };
+    impl<F> Default for FlagSetU8<F> {
+        fn default() -> Self {
+            Self {
+                bits: u8::MIN,
+                flag: Default::default(),
+            }
+        }
     }
 
-    impl BitAnd for FlagSetU8 {
+    impl<F: ALUFlag + Eq> BitwiseOps for FlagSetU8<F> {}
+
+    impl<F> BitAnd for FlagSetU8<F> {
         type Output = Self;
 
         fn bitand(mut self, rhs: Self) -> Self::Output {
@@ -52,7 +60,7 @@ pub mod bit8 {
         }
     }
 
-    impl BitOr for FlagSetU8 {
+    impl<F> BitOr for FlagSetU8<F> {
         type Output = Self;
 
         fn bitor(mut self, rhs: Self) -> Self::Output {
@@ -61,19 +69,19 @@ pub mod bit8 {
         }
     }
 
-    impl BitAndAssign for FlagSetU8 {
+    impl<F> BitAndAssign for FlagSetU8<F> {
         fn bitand_assign(&mut self, rhs: Self) {
             self.bits &= rhs.bits;
         }
     }
 
-    impl BitOrAssign for FlagSetU8 {
+    impl<F> BitOrAssign for FlagSetU8<F> {
         fn bitor_assign(&mut self, rhs: Self) {
             self.bits |= rhs.bits;
         }
     }
 
-    impl Not for FlagSetU8 {
+    impl<F> Not for FlagSetU8<F> {
         type Output = Self;
 
         fn not(mut self) -> Self::Output {
@@ -82,7 +90,7 @@ pub mod bit8 {
         }
     }
 
-    impl<F: ALUFlag + IntoEnumIterator + Eq> FlagSet<F> for FlagSetU8 {
+    impl<F: ALUFlag + IntoEnumIterator + Eq> FlagSet<F> for FlagSetU8<F> {
         fn set(mut self, flag: F) -> Self {
             self.bits |= 1 << F::iter().position(|f| f == flag).unwrap();
             self
@@ -111,9 +119,6 @@ mod tests {
     }
 
     impl TestFlag {
-        fn nth(self) -> usize {
-            TestFlag::iter().position(|x| x == self).unwrap()
-        }
         fn into_u8(self) -> u8 {
             match self {
                 TestFlag::Ovf => 8,
@@ -124,11 +129,11 @@ mod tests {
 
     impl ALUFlag for TestFlag {}
 
-    impl FlagSetScrambled<TestFlag, u8> for FlagSetU8 {
+    impl FlagSetScrambled<TestFlag, u8> for FlagSetU8<TestFlag> {
         fn scrambled(self) -> u8 {
             self.into_flags()
                 .into_iter()
-                .fold(2, |acc, f: TestFlag| acc | f.into_u8())
+                .fold(2, |acc, f| acc | f.into_u8())
         }
     }
 
@@ -138,7 +143,9 @@ mod tests {
         assert_eq!(TestFlag::iter().collect::<Vec<_>>(), vec![Ovf, Zero]);
         let fs = FlagSetU8::default().set(Ovf).set(Zero).set(Ovf);
         assert_eq!(fs.scrambled(), 11);
-        let fs = fs.reset(Zero);
-        assert_eq!(fs.scrambled(), 10);
+        let ft = fs.reset(Zero);
+        assert_eq!(ft.scrambled(), 10);
+        assert_eq!((fs | ft).scrambled(), 11);
+        assert_eq!((fs & ft).scrambled(), 10);
     }
 }

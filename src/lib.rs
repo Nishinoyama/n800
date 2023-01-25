@@ -61,6 +61,15 @@ pub mod cpu {
         }
 
         impl I8080 {
+            fn reg_as_u8(&self, code: I8080RegisterCode) -> u8 {
+                self.regs.get(&code).map(|x| x.read()).unwrap_or_default()
+            }
+            fn reg_as_u16(&self, code: I8080RegisterCode) -> u16 {
+                u16::from_be_bytes(
+                    code.pair()
+                        .map(|c| self.regs.get(&c).map(|x| x.read()).unwrap_or_default()),
+                )
+            }
             pub fn reg_load(&mut self, code: I8080RegisterCode) {
                 let data = self.read_data();
                 self.regs.entry(code).or_default().load(data);
@@ -70,9 +79,7 @@ pub mod cpu {
                     .load(self.regs.entry(code).or_default().read());
             }
             pub fn reg_address_load(&mut self, code: I8080RegisterCode) {
-                self.address_bus_reg.load(u16::from_be_bytes(
-                    code.pair().map(|c| self.regs.entry(c).or_default().read()),
-                ))
+                self.address_bus_reg.load(self.reg_as_u16(code));
             }
             pub fn store<M: Memory<Data = u8, Address = u16>>(&self, m: &mut M) {
                 m.write(self.address_bus_reg.read(), self.read_data())

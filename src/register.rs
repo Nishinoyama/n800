@@ -3,36 +3,33 @@ use crate::bits::BitsSignal;
 pub trait Register: Sized {
     type Size: BitsSignal;
     fn read(&self) -> Self::Size;
-    fn load(self, bits: Self::Size) -> Self;
-    fn masked(self, mask: Self::Size) -> MaskedRegister<Self> {
+    fn load(&mut self, bits: Self::Size);
+    fn masked(&mut self, mask: Self::Size) -> MaskedRegister<Self> {
         MaskedRegister { reg: self, mask }
     }
 }
 
-pub struct MaskedRegister<R: Register> {
-    reg: R,
+pub struct MaskedRegister<'a, R: Register> {
+    reg: &'a mut R,
     mask: <R as Register>::Size,
 }
 
-impl<R: Register> MaskedRegister<R> {
-    pub fn unmasked(self) -> R {
+impl<'a, R: Register> MaskedRegister<'a, R> {
+    pub fn unmasked(self) -> &'a mut R {
         self.reg
     }
 }
 
-impl<R: Register> Register for MaskedRegister<R> {
+impl<'a, R: Register> Register for MaskedRegister<'a, R> {
     type Size = <R as Register>::Size;
 
     fn read(&self) -> Self::Size {
         self.reg.read() & self.mask
     }
 
-    fn load(self, bits: Self::Size) -> Self {
+    fn load(&mut self, bits: Self::Size) {
         let bits = (bits & self.mask) | (self.reg.read() & !self.mask);
-        Self {
-            reg: self.reg.load(bits),
-            ..self
-        }
+        self.reg.load(bits)
     }
 }
 
@@ -66,21 +63,17 @@ pub mod bit8 {
         pub fn split(self) -> (Register8, Register8) {
             (self.h, self.l)
         }
-        pub fn increment(self) -> Self {
+        pub fn increment(&mut self) {
             let hl = u16::from_be_bytes([self.h.read(), self.l.read()]);
             let [h, l] = hl.wrapping_add(1).to_be_bytes();
-            Self {
-                h: Register8::new(h),
-                l: Register8::new(l),
-            }
+            self.h.load(h);
+            self.l.load(l);
         }
-        pub fn decrement(self) -> Self {
+        pub fn decrement(&mut self) {
             let hl = u16::from_be_bytes([self.h.read(), self.l.read()]);
             let [h, l] = hl.wrapping_sub(1).to_be_bytes();
-            Self {
-                h: Register8::new(h),
-                l: Register8::new(l),
-            }
+            self.h.load(h);
+            self.l.load(l);
         }
     }
 
@@ -90,9 +83,8 @@ pub mod bit8 {
         fn read(&self) -> Self::Size {
             self.bits
         }
-        fn load(mut self, bits: Self::Size) -> Self {
-            self.bits = bits;
-            self
+        fn load(&mut self, bits: Self::Size) {
+            self.bits = bits
         }
     }
 
@@ -102,12 +94,10 @@ pub mod bit8 {
         fn read(&self) -> Self::Size {
             u16::from_be_bytes([self.h.read(), self.l.read()])
         }
-        fn load(self, bits: Self::Size) -> Self {
+        fn load(&mut self, bits: Self::Size) {
             let [h, l] = bits.to_be_bytes();
-            Self {
-                h: Register8::new(h),
-                l: Register8::new(l),
-            }
+            self.h.load(h);
+            self.l.load(l);
         }
     }
 
@@ -117,16 +107,17 @@ pub mod bit8 {
 
         #[test]
         fn reg8_16() {
-            let reg = Register8::new(3);
-            let reg = reg.load(13);
+            let mut reg = Register8::new(3);
+            reg.load(13);
             assert_eq!(reg.read(), 13);
-            let reg16 = Register8Pair::new(Register8::new(10), Register8::new(32));
+            let mut reg16 = Register8Pair::new(Register8::new(10), Register8::new(32));
             assert_eq!(reg16.read(), 2592);
-            let reg16 = Register8Pair::from_tuple(reg16.load(3141).split());
+            reg16.load(3141);
+            let mut reg16 = Register8Pair::from_tuple(reg16.split());
             assert_eq!(reg16.read(), 3141);
-            let reg16 = reg16.increment();
+            reg16.increment();
             assert_eq!(reg16.read(), 3142);
-            let reg16 = reg16.decrement();
+            reg16.decrement();
             assert_eq!(reg16.read(), 3141);
             let (h, l) = reg16.split();
             assert_eq!(h.read(), 12);
@@ -135,9 +126,14 @@ pub mod bit8 {
 
         #[test]
         fn reg8_flag_reg() {
-            let reg = Register8::default().masked(0x33).load(0x55).unmasked();
+            let mut reg = Register8::default();
+            let mut reg = reg.masked(0x33);
+            reg.load(0x55);
+            let reg = reg.unmasked();
             assert_eq!(reg.read(), 0x11);
-            let reg = reg.masked(0x66).load(0x44).unmasked();
+            let mut reg = reg.masked(0x66);
+            reg.load(0x44);
+            let reg = reg.unmasked();
             assert_eq!(reg.read(), 0x55);
         }
     }

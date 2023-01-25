@@ -1,18 +1,17 @@
-use enumset::EnumSetType;
+use enumset::{EnumSet, EnumSetType};
 
 pub trait ALU {
+    type Flag: StatusFlag;
     type Data;
-    /// flag scrambler is containing!
-    fn op(self, lhs: Self::Data, rhs: Self::Data) -> (Self::Data, Self::Data);
+    fn op(self, lhs: Self::Data, rhs: Self::Data) -> (Self::Data, EnumSet<Self::Flag>);
 }
 
-pub trait ALUFlag: Sized + Copy + EnumSetType {}
+pub trait StatusFlag: Sized + Copy + EnumSetType {}
 
 #[cfg(test)]
 mod tests {
-    use crate::alu::{ALUFlag, ALU};
+    use crate::alu::{StatusFlag, ALU};
     use enumset::{EnumSet, EnumSetType};
-    use std::ops::Sub;
 
     #[derive(Debug, EnumSetType)]
     enum TestFlag {
@@ -20,16 +19,7 @@ mod tests {
         Zero,
     }
 
-    impl TestFlag {
-        fn into_u8(self) -> u8 {
-            match self {
-                TestFlag::Ovf => 8,
-                TestFlag::Zero => 1,
-            }
-        }
-    }
-
-    impl ALUFlag for TestFlag {}
+    impl StatusFlag for TestFlag {}
 
     #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
     struct TestAdder {
@@ -62,9 +52,10 @@ mod tests {
     }
 
     impl ALU for TestAdder {
+        type Flag = TestFlag;
         type Data = u8;
 
-        fn op(self, lhs: Self::Data, mut rhs: Self::Data) -> (Self::Data, Self::Data) {
+        fn op(self, lhs: Self::Data, mut rhs: Self::Data) -> (Self::Data, EnumSet<Self::Flag>) {
             if self.neg {
                 rhs = !rhs;
             }
@@ -75,47 +66,28 @@ mod tests {
             } else {
                 rhs.overflowing_add(lhs)
             };
-            let mut status = 2;
+            let mut status = EnumSet::empty();
             if self.neg ^ ovf {
-                status += TestFlag::Ovf.into_u8();
+                status |= TestFlag::Ovf;
             };
             if res == 0 {
-                status += TestFlag::Zero.into_u8();
+                status |= TestFlag::Zero;
             };
             (res, status)
         }
     }
 
-    fn scramble(flags: EnumSet<TestFlag>) -> u8 {
-        flags.iter().fold(2, |acc, f| acc | f.into_u8())
-    }
-
-    #[test]
-    fn iter() {
-        use TestFlag::*;
-        assert_eq!(
-            EnumSet::<TestFlag>::all().into_iter().collect::<Vec<_>>(),
-            vec![Ovf, Zero]
-        );
-        let fs = Ovf | Zero | Ovf;
-        assert_eq!(scramble(fs), 11);
-        let ft = fs.sub(Zero);
-        assert_eq!(scramble(ft), 10);
-        assert_eq!(scramble(fs | ft), 11);
-        assert_eq!(scramble(fs & ft), 10);
-        assert_eq!(scramble(!fs & ft), 2);
-    }
-
     #[test]
     fn alu() {
-        assert_eq!(TestAdder::adder().op(10, 3), (13, 2));
-        assert_eq!(TestAdder::adder().op(103, 191), (38, 10));
-        assert_eq!(TestAdder::adder().op(1, 255), (0, 11));
-        assert_eq!(TestAdder::carried_adder().op(0, 255), (0, 11));
-        assert_eq!(TestAdder::carried_adder().op(6, 9), (16, 2));
-        assert_eq!(TestAdder::subber().op(10, 3), (7, 2));
-        assert_eq!(TestAdder::subber().op(10, 13), (253, 10));
-        assert_eq!(TestAdder::subber().op(13, 13), (0, 3));
-        assert_eq!(TestAdder::borrowed_subber().op(10, 3), (6, 2));
+        use TestFlag::*;
+        assert_eq!(TestAdder::adder().op(10, 3), (13, EnumSet::empty()));
+        assert_eq!(TestAdder::adder().op(103, 191), (38, Ovf.into()));
+        assert_eq!(TestAdder::adder().op(1, 255), (0, Ovf | Zero));
+        assert_eq!(TestAdder::carried_adder().op(0, 255), (0, Ovf | Zero));
+        assert_eq!(TestAdder::carried_adder().op(6, 9), (16, EnumSet::empty()));
+        assert_eq!(TestAdder::subber().op(10, 3), (7, EnumSet::empty()));
+        assert_eq!(TestAdder::subber().op(10, 13), (253, Ovf.into()));
+        assert_eq!(TestAdder::subber().op(13, 13), (0, Zero.into()));
+        assert_eq!(TestAdder::borrowed_subber().op(10, 3), (6, EnumSet::empty()));
     }
 }

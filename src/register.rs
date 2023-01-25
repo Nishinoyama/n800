@@ -1,15 +1,11 @@
-pub trait RegisterLoad: RegisterRead {
-    type Register;
-    fn load(self, bits: Self::Size) -> Self::Register;
-}
-
-pub trait RegisterRead {
+pub trait Register {
     type Size;
     fn read(&self) -> Self::Size;
+    fn load(self, bits: Self::Size) -> Self;
 }
 
 pub mod bit8 {
-    use crate::register::{RegisterLoad, RegisterRead};
+    use crate::register::{Register};
 
     #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
     pub struct Register8 {
@@ -43,37 +39,30 @@ pub mod bit8 {
         }
     }
 
-    impl RegisterRead for Register8 {
+    impl Register for Register8 {
         type Size = u8;
 
         fn read(&self) -> Self::Size {
             self.bits
         }
-    }
-
-    impl RegisterLoad for Register8 {
-        type Register = Self;
-
-        fn load(mut self, bits: Self::Size) -> Self::Register {
+        fn load(mut self, bits: Self::Size) -> Self {
             self.bits = bits;
             self
         }
     }
 
-    impl RegisterRead for Register8Pair {
+    impl Register for Register8Pair {
         type Size = u16;
 
         fn read(&self) -> Self::Size {
             u16::from_be_bytes([self.h.read(), self.l.read()])
         }
-    }
-
-    impl RegisterLoad for Register8Pair {
-        type Register = (Register8, Register8);
-
-        fn load(self, bits: Self::Size) -> Self::Register {
+        fn load(self, bits: Self::Size) -> Self {
             let [h, l] = bits.to_be_bytes();
-            (self.h.load(h), self.l.load(l))
+            Self {
+                h: Register8::new(h),
+                l: Register8::new(l),
+            }
         }
     }
 
@@ -91,20 +80,18 @@ pub mod bit8 {
         }
     }
 
-    impl RegisterRead for MaskedRegister8 {
+    impl Register for MaskedRegister8 {
         type Size = u8;
 
         fn read(&self) -> Self::Size {
             self.reg.read() & self.mask
         }
-    }
-
-    impl RegisterLoad for MaskedRegister8 {
-        type Register = Register8;
-
-        fn load(self, bits: Self::Size) -> Self::Register {
+        fn load(self, bits: Self::Size) -> Self {
             let bits = (bits & self.mask) | (self.reg.read() & !self.mask);
-            self.reg.load(bits)
+            Self {
+                reg: Register8::new(bits),
+                ..self
+            }
         }
     }
 
@@ -119,7 +106,7 @@ pub mod bit8 {
             assert_eq!(reg.read(), 13);
             let reg16 = Register8Pair::new(Register8::new(10), Register8::new(32));
             assert_eq!(reg16.read(), 2592);
-            let reg16 = Register8Pair::from_tuple(reg16.load(3141));
+            let reg16 = Register8Pair::from_tuple(reg16.load(3141).split());
             assert_eq!(reg16.read(), 3141);
             let (h, l) = reg16.split();
             assert_eq!(h.read(), 12);
@@ -128,9 +115,9 @@ pub mod bit8 {
 
         #[test]
         fn reg8_flag_reg() {
-            let reg = Register8::default().masked(0x33).load(0x55);
+            let reg = Register8::default().masked(0x33).load(0x55).unmasked();
             assert_eq!(reg.read(), 0x11);
-            let reg = reg.masked(0x66).load(0x44);
+            let reg = reg.masked(0x66).load(0x44).unmasked();
             assert_eq!(reg.read(), 0x55);
         }
     }

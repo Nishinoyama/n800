@@ -1,6 +1,6 @@
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
 
-pub trait BitwiseOps:
+pub trait BitsSignal:
     BitAnd<Output = Self>
     + BitOr<Output = Self>
     + BitAndAssign
@@ -17,7 +17,7 @@ pub trait BitwiseOps:
 macro_rules! bitwise_ops_impl {
 ($($t:ty)*) =>
     {$(
-        impl BitwiseOps for $t {
+        impl BitsSignal for $t {
             // const ALL_ONE: Self = <$t>::MAX;
             // const ALL_ZERO: Self = <$t>::MIN;
         }

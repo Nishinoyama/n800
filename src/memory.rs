@@ -1,4 +1,4 @@
-pub trait Memory {
+pub trait Memory: Send {
     type Data;
     type Address;
     fn write(&mut self, address: Self::Address, data: Self::Data);

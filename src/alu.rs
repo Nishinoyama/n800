@@ -3,6 +3,7 @@ use enumset::{EnumSet, EnumSetType};
 pub trait ALU {
     type Flag: Flag;
     type Data;
+    /// if operation is unary, lhs won't be used.
     fn op(&self, lhs: Self::Data, rhs: Self::Data) -> (Self::Data, EnumSet<Self::Flag>);
 }
 
@@ -115,15 +116,115 @@ pub mod bit8 {
         }
     }
 
-    #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
-    pub struct LogicalAnder {}
+    #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+    pub enum IncDecOperator {
+        Increase,
+        Decrease,
+    }
 
-    impl ALU for LogicalAnder {
+    impl ALU for IncDecOperator {
+        type Flag = StatusFlag;
+        type Data = u8;
+
+        fn op(&self, _lhs: Self::Data, rhs: Self::Data) -> (Self::Data, EnumSet<Self::Flag>) {
+            let (res, carry) = match self {
+                IncDecOperator::Increase => rhs.overflowing_add(1),
+                IncDecOperator::Decrease => rhs.overflowing_sub(1),
+            };
+            let mut status = StatusFlag::set_by_result(res);
+            if carry {
+                status |= StatusFlag::Carry;
+            }
+            (res, status)
+        }
+    }
+
+    #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+    pub enum LogicalOperator {
+        And,
+        Or,
+        Not,
+        Xor,
+    }
+
+    impl ALU for LogicalOperator {
         type Flag = StatusFlag;
         type Data = u8;
 
         fn op(&self, lhs: Self::Data, rhs: Self::Data) -> (Self::Data, EnumSet<Self::Flag>) {
-            (lhs & rhs, StatusFlag::AuxiliaryCarry.into())
+            let res = match self {
+                LogicalOperator::And => lhs & rhs,
+                LogicalOperator::Or => lhs | rhs,
+                LogicalOperator::Not => !rhs,
+                LogicalOperator::Xor => lhs ^ rhs,
+            };
+            (res, StatusFlag::set_by_result(res))
+        }
+    }
+
+    #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+    pub struct Rotator {
+        carry: bool,
+        through_carry: bool,
+        rotate_right: bool,
+    }
+
+    impl Rotator {
+        pub fn new(carry: bool, through_carry: bool, rotate_right: bool) -> Self {
+            Self {
+                carry,
+                through_carry,
+                rotate_right,
+            }
+        }
+        pub fn rotate_left() -> Self {
+            Self {
+                carry: false,
+                through_carry: false,
+                rotate_right: false,
+            }
+        }
+        pub fn rotate_right() -> Self {
+            Self {
+                carry: false,
+                through_carry: false,
+                rotate_right: true,
+            }
+        }
+        pub fn through_carry(self) -> Self {
+            Self {
+                through_carry: true,
+                ..self
+            }
+        }
+        pub fn carried(self, carry: bool) -> Self {
+            Self { carry, ..self }
+        }
+    }
+
+    impl ALU for Rotator {
+        type Flag = StatusFlag;
+        type Data = u8;
+
+        fn op(&self, _lhs: Self::Data, mut rhs: Self::Data) -> (Self::Data, EnumSet<Self::Flag>) {
+            if self.rotate_right {
+                rhs = rhs.reverse_bits()
+            }
+            let mut res = rhs << 1;
+            let carry = rhs >= 0x80;
+            let mut status = EnumSet::empty();
+            if carry {
+                status |= StatusFlag::Carry;
+            }
+            if self.through_carry {
+                res |= self.carry as u8;
+            } else {
+                res |= carry as u8;
+            }
+            if self.rotate_right {
+                res = res.reverse_bits()
+            }
+            (res, status)
         }
     }
 
@@ -201,7 +302,10 @@ pub mod bit8 {
             let alus: Vec<Box<dyn ALU<Flag = StatusFlag, Data = u8>>> = vec![
                 (Box::new(Adder::adder())),
                 (Box::new(Adder::subber())),
-                (Box::new(LogicalAnder {})),
+                (Box::new(LogicalOperator::And)),
+                (Box::new(LogicalOperator::Or)),
+                (Box::new(LogicalOperator::Xor)),
+                (Box::new(LogicalOperator::Not)),
             ];
             println!(
                 "{:?}",
@@ -227,6 +331,42 @@ pub mod bit8 {
                     }
                 }
             }
+        }
+
+        #[test]
+        fn rotate() {
+            let t = 0b0011_0011;
+            assert_eq!(
+                Rotator::rotate_left().op(0, t),
+                (0b0110_0110, EnumSet::empty())
+            );
+            assert_eq!(
+                Rotator::rotate_left()
+                    .through_carry()
+                    .carried(true)
+                    .op(0, t),
+                (0b0110_0111, EnumSet::empty())
+            );
+            assert_eq!(
+                Rotator::rotate_right().through_carry().op(0, t),
+                (0b0001_1001, StatusFlag::Carry.into())
+            );
+            assert_eq!(
+                Rotator::rotate_right().op(0, t),
+                (0b1001_1001, StatusFlag::Carry.into())
+            );
+            let t = 0b1000_1000;
+            assert_eq!(
+                Rotator::rotate_left()
+                    .through_carry()
+                    .carried(true)
+                    .op(0, t),
+                (0b0001_0001, StatusFlag::Carry.into())
+            );
+            assert_eq!(
+                Rotator::rotate_left().through_carry().op(0, t),
+                (0b0001_0000, StatusFlag::Carry.into())
+            );
         }
     }
 }

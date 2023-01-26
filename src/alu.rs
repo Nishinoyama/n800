@@ -66,7 +66,6 @@ mod tests {
         if auxiliary_carry {
             status |= StatusFlag::AuxiliaryCarry;
         }
-        println!("{:x} + {:x} = {:x} ({:?})", lhs, rhs, res, status);
         (res, status)
     }
 
@@ -129,6 +128,50 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
+    struct TestDecimalAdjustAccumulator {
+        carry: bool,
+        auxiliary: bool,
+    }
+
+    impl TestDecimalAdjustAccumulator {
+        pub fn from_status(status: EnumSet<StatusFlag>) -> Self {
+            Self {
+                carry: status.contains(StatusFlag::Carry),
+                auxiliary: status.contains(StatusFlag::AuxiliaryCarry),
+            }
+        }
+    }
+
+    impl ALU for TestDecimalAdjustAccumulator {
+        type Flag = StatusFlag;
+        type Data = u8;
+
+        fn op(&self, _lhs: Self::Data, rhs: Self::Data) -> (Self::Data, EnumSet<Self::Flag>) {
+            let mut lsb = rhs & 0xf;
+            if self.auxiliary || lsb >= 10 {
+                lsb += 6;
+            }
+            let mut msb = rhs >> 4;
+            if lsb >= 0x10 {
+                msb += 1;
+            }
+            if self.carry || msb >= 10 {
+                msb += 6;
+            }
+            let res = (msb << 4) | (lsb & 0xf);
+            let mut status = StatusFlag::set_by_result(res);
+            if lsb >= 0x10 {
+                // unspecified
+                status |= StatusFlag::AuxiliaryCarry;
+            }
+            if msb >= 0x10 || self.carry {
+                status |= StatusFlag::Carry;
+            }
+            (res, status)
+        }
+    }
+
     #[test]
     fn alu() {
         use StatusFlag::*;
@@ -162,5 +205,26 @@ mod tests {
             "{:?}",
             alus.iter().map(|alu| alu.op(31, 41)).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn daa() {
+        for lhs in 0..=255 {
+            if let Ok(ld) = format!("{lhs:x}").parse::<u8>() {
+                for rhs in 0..=255 {
+                    if let Ok(rd) = format!("{rhs:x}").parse::<u8>() {
+                        let (res, status) = TestAdder::adder().op(lhs, rhs);
+                        let (res, status) =
+                            TestDecimalAdjustAccumulator::from_status(status).op(0, res);
+                        if let Ok(res) = format!("{res:x}").parse::<u8>() {
+                            assert_eq!(res, (ld + rd) % 100);
+                            assert_eq!(status.contains(StatusFlag::Carry), (ld + rd) >= 100)
+                        } else {
+                            panic!("decimal adjust fail")
+                        }
+                    }
+                }
+            }
+        }
     }
 }

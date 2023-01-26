@@ -1,8 +1,41 @@
 pub trait Memory {
     type Data;
     type Address;
-    fn write(&self, address: Self::Address, data: Self::Data);
+    fn write(&mut self, address: Self::Address, data: Self::Data);
     fn read(&self, address: Self::Address) -> Self::Data;
+}
+
+#[derive(Debug)]
+pub struct RamB8A16 {
+    ram: [u8; u16::MAX as usize],
+}
+
+impl RamB8A16 {
+    pub fn new() -> Self {
+        Self {
+            ram: [0; u16::MAX as usize],
+        }
+    }
+    pub fn flash(&mut self, data: &[u8], displacement: u16) {
+        let displacement = displacement as usize;
+        for (i, &x) in data.iter().enumerate() {
+            let i = (displacement + i) % (u16::MAX as usize);
+            self.ram[i] = x;
+        }
+    }
+}
+
+impl Memory for RamB8A16 {
+    type Data = u8;
+    type Address = u16;
+
+    fn write(&mut self, address: Self::Address, data: Self::Data) {
+        self.ram[address as usize] = data
+    }
+
+    fn read(&self, address: Self::Address) -> Self::Data {
+        self.ram[address as usize]
+    }
 }
 
 mod gb {

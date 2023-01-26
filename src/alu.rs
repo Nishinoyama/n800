@@ -9,7 +9,7 @@ pub trait ALU {
 pub trait Flag: Sized + Copy + EnumSetType {}
 
 #[derive(Debug, EnumSetType)]
-enum StatusFlag {
+pub enum StatusFlag {
     /// result is zero.
     Zero,
     /// result is signed.
@@ -42,8 +42,7 @@ impl StatusFlag {
 
 impl Flag for StatusFlag {}
 
-#[cfg(test)]
-mod tests {
+pub mod bit8 {
     use crate::alu::{StatusFlag, ALU};
     use enumset::EnumSet;
 
@@ -70,28 +69,28 @@ mod tests {
     }
 
     #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
-    struct TestAdder {
+    pub struct Adder {
         neg: bool,
         cin: bool,
     }
 
-    impl TestAdder {
-        fn adder() -> Self {
+    impl Adder {
+        pub fn adder() -> Self {
             Self::default()
         }
-        fn subber() -> Self {
+        pub fn subber() -> Self {
             Self {
                 neg: true,
                 cin: true,
             }
         }
-        fn carried_adder() -> Self {
+        pub fn carried_adder() -> Self {
             Self {
                 neg: false,
                 cin: true,
             }
         }
-        fn borrowed_subber() -> Self {
+        pub fn borrowed_subber() -> Self {
             Self {
                 neg: true,
                 cin: false,
@@ -99,7 +98,7 @@ mod tests {
         }
     }
 
-    impl ALU for TestAdder {
+    impl ALU for Adder {
         type Flag = StatusFlag;
         type Data = u8;
 
@@ -117,9 +116,9 @@ mod tests {
     }
 
     #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
-    struct TestBitwiseAnd {}
+    pub struct LogicalAnder {}
 
-    impl ALU for TestBitwiseAnd {
+    impl ALU for LogicalAnder {
         type Flag = StatusFlag;
         type Data = u8;
 
@@ -129,12 +128,12 @@ mod tests {
     }
 
     #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
-    struct TestDecimalAdjustAccumulator {
+    pub struct DecimalAdjuster {
         carry: bool,
         auxiliary: bool,
     }
 
-    impl TestDecimalAdjustAccumulator {
+    impl DecimalAdjuster {
         pub fn from_status(status: EnumSet<StatusFlag>) -> Self {
             Self {
                 carry: status.contains(StatusFlag::Carry),
@@ -143,7 +142,7 @@ mod tests {
         }
     }
 
-    impl ALU for TestDecimalAdjustAccumulator {
+    impl ALU for DecimalAdjuster {
         type Flag = StatusFlag;
         type Data = u8;
 
@@ -171,56 +170,59 @@ mod tests {
             (res, status)
         }
     }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
-    #[test]
-    fn alu() {
-        use StatusFlag::*;
-        let adder = TestAdder::adder();
-        assert_eq!(adder.op(10, 3), (13, EnumSet::empty()));
-        assert_eq!(adder.op(103, 191), (38, Carry | AuxiliaryCarry));
-        assert_eq!(
-            adder.op(1, 255),
-            (0, Carry | Zero | Parity | AuxiliaryCarry)
-        );
-        assert_eq!(adder.op(1, 254), (255, Parity | Sign));
-        assert_eq!(adder.op(0x19, 0x28), (0x41, AuxiliaryCarry | Parity));
-        let c_adder = TestAdder::carried_adder();
-        assert_eq!(
-            c_adder.op(0, 255),
-            (0, Carry | Zero | Parity | AuxiliaryCarry)
-        );
-        assert_eq!(c_adder.op(6, 9), (16, AuxiliaryCarry.into()));
-        let subber = TestAdder::subber();
-        assert_eq!(subber.op(18, 3), (15, Parity | AuxiliaryCarry));
-        assert_eq!(subber.op(16, 19), (253, Sign | Carry | AuxiliaryCarry));
-        assert_eq!(subber.op(9, 9), (0, Zero | Parity));
-        let b_subber = TestAdder::borrowed_subber();
-        assert_eq!(b_subber.op(10, 3), (6, Parity.into()));
-        let alus: Vec<Box<dyn ALU<Flag = StatusFlag, Data = u8>>> = vec![
-            (Box::new(TestAdder::adder())),
-            (Box::new(TestAdder::subber())),
-            (Box::new(TestBitwiseAnd {})),
-        ];
-        println!(
-            "{:?}",
-            alus.iter().map(|alu| alu.op(31, 41)).collect::<Vec<_>>()
-        );
-    }
+        #[test]
+        fn alu() {
+            use StatusFlag::*;
+            let adder = Adder::adder();
+            assert_eq!(adder.op(10, 3), (13, EnumSet::empty()));
+            assert_eq!(adder.op(103, 191), (38, Carry | AuxiliaryCarry));
+            assert_eq!(
+                adder.op(1, 255),
+                (0, Carry | Zero | Parity | AuxiliaryCarry)
+            );
+            assert_eq!(adder.op(1, 254), (255, Parity | Sign));
+            assert_eq!(adder.op(0x19, 0x28), (0x41, AuxiliaryCarry | Parity));
+            let c_adder = Adder::carried_adder();
+            assert_eq!(
+                c_adder.op(0, 255),
+                (0, Carry | Zero | Parity | AuxiliaryCarry)
+            );
+            assert_eq!(c_adder.op(6, 9), (16, AuxiliaryCarry.into()));
+            let subber = Adder::subber();
+            assert_eq!(subber.op(18, 3), (15, Parity | AuxiliaryCarry));
+            assert_eq!(subber.op(16, 19), (253, Sign | Carry | AuxiliaryCarry));
+            assert_eq!(subber.op(9, 9), (0, Zero | Parity));
+            let b_subber = Adder::borrowed_subber();
+            assert_eq!(b_subber.op(10, 3), (6, Parity.into()));
+            let alus: Vec<Box<dyn ALU<Flag = StatusFlag, Data = u8>>> = vec![
+                (Box::new(Adder::adder())),
+                (Box::new(Adder::subber())),
+                (Box::new(LogicalAnder {})),
+            ];
+            println!(
+                "{:?}",
+                alus.iter().map(|alu| alu.op(31, 41)).collect::<Vec<_>>()
+            );
+        }
 
-    #[test]
-    fn daa() {
-        for lhs in 0..=255 {
-            if let Ok(ld) = format!("{lhs:x}").parse::<u8>() {
-                for rhs in 0..=255 {
-                    if let Ok(rd) = format!("{rhs:x}").parse::<u8>() {
-                        let (res, status) = TestAdder::adder().op(lhs, rhs);
-                        let (res, status) =
-                            TestDecimalAdjustAccumulator::from_status(status).op(0, res);
-                        if let Ok(res) = format!("{res:x}").parse::<u8>() {
-                            assert_eq!(res, (ld + rd) % 100);
-                            assert_eq!(status.contains(StatusFlag::Carry), (ld + rd) >= 100)
-                        } else {
-                            panic!("decimal adjust fail")
+        #[test]
+        fn daa() {
+            for lhs in 0..=255 {
+                if let Ok(ld) = format!("{lhs:x}").parse::<u8>() {
+                    for rhs in 0..=255 {
+                        if let Ok(rd) = format!("{rhs:x}").parse::<u8>() {
+                            let (res, status) = Adder::adder().op(lhs, rhs);
+                            let (res, status) = DecimalAdjuster::from_status(status).op(0, res);
+                            if let Ok(res) = format!("{res:x}").parse::<u8>() {
+                                assert_eq!(res, (ld + rd) % 100);
+                                assert_eq!(status.contains(StatusFlag::Carry), (ld + rd) >= 100)
+                            } else {
+                                panic!("decimal adjust fail")
+                            }
                         }
                     }
                 }

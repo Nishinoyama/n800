@@ -19,8 +19,6 @@ pub enum StatusFlag {
     Parity,
     /// result cause carrying
     Carry,
-    /// result is too large to fit a word
-    Overflow,
     /// result on bcd overflowing
     AuxiliaryCarry,
 }

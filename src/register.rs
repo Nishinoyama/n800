@@ -64,22 +64,26 @@ pub mod bit8 {
             (self.h, self.l)
         }
         pub fn increment(&mut self) {
-            let hl = u16::from_be_bytes([self.h.read(), self.l.read()]);
+            let hl = self.as_u16();
             let [h, l] = hl.wrapping_add(1).to_be_bytes();
             self.h.load(h);
             self.l.load(l);
         }
         pub fn decrement(&mut self) {
-            let hl = u16::from_be_bytes([self.h.read(), self.l.read()]);
+            let hl = self.as_u16();
             let [h, l] = hl.wrapping_sub(1).to_be_bytes();
             self.h.load(h);
             self.l.load(l);
+        }
+        pub fn as_u16(&self) -> u16 {
+            u16::from_be_bytes([self.h.read(), self.l.read()])
         }
     }
 
     impl Register for Register8 {
         type Size = u8;
 
+        #[must_use]
         fn read(&self) -> Self::Size {
             self.bits
         }

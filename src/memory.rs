@@ -10,11 +10,17 @@ pub struct RamB8A16 {
     ram: [u8; u16::MAX as usize],
 }
 
-impl RamB8A16 {
-    pub fn new() -> Self {
+impl Default for RamB8A16 {
+    fn default() -> Self {
         Self {
             ram: [0; u16::MAX as usize],
         }
+    }
+}
+
+impl RamB8A16 {
+    pub fn new() -> Self {
+        Default::default()
     }
     pub fn flash(&mut self, data: &[u8], displacement: u16) {
         let displacement = displacement as usize;

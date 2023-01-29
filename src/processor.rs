@@ -38,8 +38,8 @@ pub trait ProcMemory {
 pub mod i8080 {
     use crate::alu::bit8::Adder;
     use crate::alu::{StatusFlag, ALU};
-    use crate::cpu::{AddressBus, DataBus, DataBusLoad, DataBusRead, ProcMemory};
     use crate::memory::{Memory, RamB8A16};
+    use crate::processor::{AddressBus, DataBus, DataBusLoad, DataBusRead, ProcMemory};
     use crate::register::bit8::{Register8, Register8Pair};
     use crate::register::Register;
     use enumset::EnumSet;

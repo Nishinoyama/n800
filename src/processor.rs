@@ -173,7 +173,7 @@ pub mod i8080 {
         SubBorrowed,
         Increment,
         Decrement,
-        Daa,
+        DecimalAdjust,
         LogicAnd,
         LogicOr,
         LogicXor,
@@ -257,12 +257,20 @@ pub mod i8080 {
         }
         // fixme: unclean
         fn reg16_increment(&mut self, dst: I8080RegisterCode16) {
-            let [h, l] = dst.split();
-            let mut wz = Register8Pair::new(self.code_reg_mut(h).reg, self.code_reg_mut(l).reg);
-            wz.increment();
-            let (w, z) = wz.split();
-            self.regs.get_mut(&h).unwrap().reg.load(w.read());
-            self.regs.get_mut(&l).unwrap().reg.load(z.read());
+            use I8080RegisterCode16::{PC, SP};
+            match dst {
+                SP => self.sp_reg.increment(),
+                PC => self.pc_reg.increment(),
+                _ => {
+                    let [h, l] = dst.split();
+                    let mut wz =
+                        Register8Pair::new(self.code_reg_mut(h).reg, self.code_reg_mut(l).reg);
+                    wz.increment();
+                    let (w, z) = wz.split();
+                    self.regs.get_mut(&h).unwrap().reg.load(w.read());
+                    self.regs.get_mut(&l).unwrap().reg.load(z.read());
+                }
+            }
         }
 
         #[must_use]
@@ -463,7 +471,7 @@ pub mod i8080 {
                 }
                 Increment => Box::new(IncDecOperator::Increase),
                 Decrement => Box::new(IncDecOperator::Decrease),
-                Daa => Box::new(DecimalAdjuster::from_status(self.flag_status())),
+                DecimalAdjust => Box::new(DecimalAdjuster::from_status(self.flag_status())),
                 LogicAnd => Box::new(LogicalOperator::And),
                 LogicOr => Box::new(LogicalOperator::Or),
                 LogicXor => Box::new(LogicalOperator::Xor),
@@ -497,11 +505,25 @@ pub mod i8080 {
             self.acc_reg().load_from_data();
         }
 
+        pub fn alu_with_reg_to_reg(&mut self, alu: I8080AluCode, rhs: I8080RegisterCode) {
+            self.code_reg_mut(rhs).read_to_data();
+            self.tmp_reg().load_from_data();
+            self.alu_op(self.alu_from_code(alu));
+            self.code_reg_mut(rhs).load_from_data();
+        }
+
         pub fn alu_with_mem(&mut self, alu: I8080AluCode) {
             self.fetch_hl();
             self.tmp_reg().load_from_data();
             self.alu_op(self.alu_from_code(alu));
             self.acc_reg().load_from_data();
+        }
+
+        pub fn alu_with_mem_to_mem(&mut self, alu: I8080AluCode) {
+            self.fetch_hl();
+            self.tmp_reg().load_from_data();
+            self.alu_op(self.alu_from_code(alu));
+            self.store();
         }
 
         pub fn alu_with_immediate(&mut self, alu: I8080AluCode) {
@@ -736,6 +758,185 @@ pub mod i8080 {
 
         /// special
         pub fn no_op(&mut self) {}
+
+        fn reg16_code_from_bits(bits: u8) -> I8080RegisterCode16 {
+            use I8080RegisterCode16::*;
+            match bits {
+                0 => BC,
+                1 => DE,
+                2 => HL,
+                3 => SP,
+                _ => unreachable!(),
+            }
+        }
+
+        fn reg_code_from_bits(bits: u8) -> I8080RegisterCode {
+            use I8080RegisterCode::*;
+            match bits {
+                0 => B,
+                1 => C,
+                2 => D,
+                3 => E,
+                4 => H,
+                5 => L,
+                7 => Acc,
+                _ => unreachable!(),
+            }
+        }
+
+        fn condition_code_from_bits(bits: u8) -> I8080JumpCondition {
+            use I8080JumpCondition::*;
+            match bits {
+                0 => OnNonZero,
+                1 => OnZero,
+                2 => OnNonCarry,
+                3 => OnCarry,
+                4 => OnParityOdd,
+                5 => OnParityEven,
+                6 => OnPlus,
+                7 => OnMinus,
+                _ => unreachable!(),
+            }
+        }
+
+        pub fn execute(&mut self) {
+            use I8080AluCode::*;
+            use I8080JumpCondition::*;
+            use I8080RegisterCode::*;
+            use I8080RegisterCode16::*;
+            self.fetch_instruction();
+            self.inst_reg.load(self.data_bus.get());
+            let (op, dst, src) = {
+                let inst = self.inst_reg.read();
+                ((inst >> 6), (inst >> 3) & 0x7, inst & 0x7)
+            };
+            match op {
+                0 => match (dst, src) {
+                    (0, 0) => self.no_op(),
+                    (_, 0) => self.no_op(), // <= unspecified
+                    (0, 7) => self.alu_with_reg(RotateLeft, Acc),
+                    (1, 7) => self.alu_with_reg(RotateRight, Acc),
+                    (2, 7) => self.alu_with_reg(RotateLeftThroughCarry, Acc),
+                    (3, 7) => self.alu_with_reg(RotateRightThroughCarry, Acc),
+                    (4, 2) => self.store_reg16_direct(HL),
+                    (4, 7) => self.alu_with_reg(DecimalAdjust, Acc),
+                    (5, 2) => self.move_reg16_direct(HL),
+                    (5, 7) => self.alu_with_reg(ComplementAcc, Acc),
+                    (6, 2) => self.store_reg_direct(Acc),
+                    (6, 4) => self.alu_with_mem_to_mem(Increment),
+                    (6, 5) => self.alu_with_mem_to_mem(Decrement),
+                    (6, 6) => self.store_hl_immediate(),
+                    (6, 7) => self.flag_complement(StatusFlag::Carry),
+                    (7, 2) => self.move_reg_direct(Acc),
+                    (7, 7) => self.flag_set(StatusFlag::Carry),
+                    (dst, 1) if dst % 2 == 0 => {
+                        self.move_reg16_immediate(Self::reg16_code_from_bits(dst / 2))
+                    }
+                    (dst, 2) if dst % 2 == 0 => {
+                        self.move_indirect(Acc, Self::reg16_code_from_bits(dst / 2))
+                    }
+                    (dst, 2) if dst % 2 == 1 => {
+                        self.move_indirect(Acc, Self::reg16_code_from_bits(dst / 2))
+                    }
+                    (dst, 3) if dst % 2 == 0 => {
+                        self.reg16_increment(Self::reg16_code_from_bits(dst / 2));
+                    }
+                    (dst, 3) if dst % 2 == 1 => {
+                        self.reg16_increment(Self::reg16_code_from_bits(dst / 2));
+                    }
+                    (dst, 4) => self.alu_with_reg_to_reg(Increment, Self::reg_code_from_bits(dst)),
+                    (dst, 5) => self.alu_with_reg_to_reg(Decrement, Self::reg_code_from_bits(dst)),
+                    (dst, 6) => self.move_reg_immediate(Self::reg_code_from_bits(dst)),
+                    (rhs, 1) if rhs % 2 == 1 => {
+                        let hl = self.code_reg16_as_u16(HL);
+                        let rp = self.code_reg16_as_u16(Self::reg16_code_from_bits(rhs));
+                        let (res, carry) = hl.overflowing_add(rp);
+                        if carry {
+                            self.code_reg_mut(Flag)
+                                .reg
+                                .masked(Self::flag_decode(StatusFlag::Carry))
+                                .load(!0)
+                        } else {
+                            self.code_reg_mut(Flag)
+                                .reg
+                                .masked(Self::flag_decode(StatusFlag::Carry))
+                                .load(0)
+                        }
+                        HL.split()
+                            .into_iter()
+                            .zip(res.to_be_bytes())
+                            .for_each(|(c, x)| self.code_reg_mut(c).reg.load(x));
+                    }
+                    _ => self.no_op(),
+                },
+                1 => match (dst, src) {
+                    (6, 6) => self.halt(),
+                    (dst, 6) => self.move_hl_mem_to_reg(Self::reg_code_from_bits(dst)),
+                    (6, src) => self.store_reg_to_hl_mem(Self::reg_code_from_bits(src)),
+                    (dst, src) => self.move_reg_to_reg(
+                        Self::reg_code_from_bits(dst),
+                        Self::reg_code_from_bits(src),
+                    ),
+                },
+                2 => match (dst, src) {
+                    (0, 6) => self.alu_with_mem(Add),
+                    (0, src) => self.alu_with_reg(Add, Self::reg_code_from_bits(src)),
+                    (1, 6) => self.alu_with_mem(AddCarried),
+                    (1, src) => self.alu_with_reg(AddCarried, Self::reg_code_from_bits(src)),
+                    (2, 6) => self.alu_with_mem(Sub),
+                    (2, src) => self.alu_with_reg(Sub, Self::reg_code_from_bits(src)),
+                    (3, 6) => self.alu_with_mem(SubBorrowed),
+                    (3, src) => self.alu_with_reg(SubBorrowed, Self::reg_code_from_bits(src)),
+                    (4, 6) => self.alu_with_mem(LogicAnd),
+                    (4, src) => self.alu_with_reg(LogicAnd, Self::reg_code_from_bits(src)),
+                    (5, 6) => self.alu_with_mem(LogicXor),
+                    (5, src) => self.alu_with_reg(LogicXor, Self::reg_code_from_bits(src)),
+                    (6, 6) => self.alu_with_mem(LogicOr),
+                    (6, src) => self.alu_with_reg(LogicOr, Self::reg_code_from_bits(src)),
+                    (7, 6) => self.cmp_with_mem(),
+                    (7, src) => self.cmp_with_reg(Self::reg_code_from_bits(src)),
+                    _ => unreachable!(),
+                },
+                3 => match (dst, src) {
+                    (1, 1) => self.ret(Anytime),
+                    (2, 1) => self.ret(Anytime), // <= unspecified
+                    (4, 1) => self.pop_reg16(PSW),
+                    (5, 1) => self.pchl(),
+                    (7, 1) => self.sphl(),
+                    (0, 3) => self.jump_immediate(Anytime),
+                    (1, 3) => self.jump_immediate(Anytime), // <= unspecified
+                    (2, 3) => self.output(),
+                    (3, 3) => self.input(),
+                    (4, 3) => self.exchange_stack_top_with_hl(),
+                    (5, 3) => self.exchange16(HL, DE),
+                    (6, 3) => self.disable_interrupt(),
+                    (7, 3) => self.enable_interrupt(),
+                    (1, 5) => self.call_immediate(Anytime),
+                    (3, 5) => self.call_immediate(Anytime), // <= unspecified
+                    (4, 5) => self.push_reg16(PSW),
+                    (5, 5) => self.call_immediate(Anytime), // <= unspecified
+                    (7, 5) => self.call_immediate(Anytime), // <= unspecified
+                    (0, 6) => self.alu_with_immediate(Add),
+                    (1, 6) => self.alu_with_immediate(AddCarried),
+                    (2, 6) => self.alu_with_immediate(Sub),
+                    (3, 6) => self.alu_with_immediate(SubBorrowed),
+                    (4, 6) => self.alu_with_immediate(LogicAnd),
+                    (5, 6) => self.alu_with_immediate(LogicXor),
+                    (6, 6) => self.alu_with_immediate(LogicOr),
+                    (7, 6) => self.cmp_with_immediate(),
+                    (cond, 0) => self.ret(Self::condition_code_from_bits(cond)),
+                    (cond, 2) => self.jump_immediate(Self::condition_code_from_bits(cond)),
+                    (cond, 4) => self.call_immediate(Self::condition_code_from_bits(cond)),
+                    (dst, 1) if dst % 2 == 0 => self.pop_reg16(Self::reg16_code_from_bits(dst / 2)),
+                    (dst, 5) if dst % 2 == 0 => {
+                        self.push_reg16(Self::reg16_code_from_bits(dst / 2))
+                    }
+                    (n, 7) => self.restart(n),
+                    _ => self.no_op(),
+                },
+                _ => unreachable!(),
+            }
+        }
     }
 
     impl ProcMemory for I8080Console {

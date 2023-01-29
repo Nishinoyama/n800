@@ -36,7 +36,7 @@ pub trait ProcMemory {
 }
 
 pub mod i8080 {
-    use crate::alu::bit8::Adder;
+    use crate::alu::bit8::{Adder, DecimalAdjuster, IncDecOperator, LogicalOperator, Rotator};
     use crate::alu::{StatusFlag, ALU};
     use crate::memory::{Memory, RamB8A16};
     use crate::processor::{AddressBus, DataBus, DataBusLoad, DataBusRead, ProcMemory};
@@ -156,6 +156,24 @@ pub mod i8080 {
                 other => panic!("{:?} Can't be Split", other),
             }
         }
+    }
+
+    pub enum I8080AluCode {
+        Add,
+        AddCarried,
+        Sub,
+        SubBorrowed,
+        Increment,
+        Decrement,
+        Daa,
+        LogicAnd,
+        LogicOr,
+        LogicXor,
+        RotateLeft,
+        RotateRight,
+        RotateLeftThroughCarry,
+        RotateRightThroughCarry,
+        ComplementAcc,
     }
 
     #[deny(unused_must_use)]
@@ -397,33 +415,126 @@ pub mod i8080 {
                 .collect()
         }
 
-        fn alu_add(&mut self) {
+        fn flag_status(&self) -> EnumSet<StatusFlag> {
             use I8080RegisterCode::Flag;
-            let alu = Adder::adder();
+            Self::flag_collect(
+                self.regs
+                    .get(&Flag)
+                    .map(|r| r.reg.read())
+                    .unwrap_or_default(),
+            )
+        }
+
+        fn alu_from_code(&self, code: I8080AluCode) -> Box<dyn ALU<Data = u8, Flag = StatusFlag>> {
+            use I8080AluCode::*;
+            use StatusFlag::Carry;
+            match code {
+                Add => Box::new(Adder::adder()),
+                AddCarried => {
+                    if self.flag_status().contains(Carry) {
+                        Box::new(Adder::carried_adder())
+                    } else {
+                        Box::new(Adder::adder())
+                    }
+                }
+                Sub => Box::new(Adder::subber()),
+                SubBorrowed => {
+                    if self.flag_status().contains(Carry) {
+                        Box::new(Adder::borrowed_subber())
+                    } else {
+                        Box::new(Adder::subber())
+                    }
+                }
+                Increment => Box::new(IncDecOperator::Increase),
+                Decrement => Box::new(IncDecOperator::Decrease),
+                Daa => Box::new(DecimalAdjuster::from_status(self.flag_status())),
+                LogicAnd => Box::new(LogicalOperator::And),
+                LogicOr => Box::new(LogicalOperator::Or),
+                LogicXor => Box::new(LogicalOperator::Xor),
+                RotateLeft => Box::new(Rotator::rotate_left()),
+                RotateRight => Box::new(Rotator::rotate_right()),
+                RotateLeftThroughCarry => Box::new(
+                    Rotator::rotate_right()
+                        .through_carry()
+                        .carried(self.flag_status().contains(Carry)),
+                ),
+                RotateRightThroughCarry => Box::new(
+                    Rotator::rotate_left()
+                        .through_carry()
+                        .carried(self.flag_status().contains(Carry)),
+                ),
+                ComplementAcc => Box::new(LogicalOperator::Not),
+            }
+        }
+
+        fn alu_op(&mut self, alu: Box<dyn ALU<Data = u8, Flag = StatusFlag>>) {
+            use I8080RegisterCode::Flag;
             let (res, flag) = alu.op(self.acc_reg().reg.read(), self.tmp_reg().reg.read());
             self.data_bus.set(res);
             self.code_reg_mut(Flag).reg.load(Self::flag_scramble(flag));
         }
 
-        pub fn add_with_reg(&mut self, rhs: I8080RegisterCode) {
+        pub fn alu_with_reg(&mut self, alu: I8080AluCode, rhs: I8080RegisterCode) {
             self.code_reg_mut(rhs).read_to_data();
             self.tmp_reg().load_from_data();
-            self.alu_add();
+            self.alu_op(self.alu_from_code(alu));
             self.acc_reg().load_from_data();
         }
 
-        pub fn add_with_mem(&mut self) {
+        pub fn alu_with_mem(&mut self, alu: I8080AluCode) {
             self.fetch_hl();
             self.tmp_reg().load_from_data();
-            self.alu_add();
+            self.alu_op(self.alu_from_code(alu));
             self.acc_reg().load_from_data();
         }
 
-        pub fn add_with_immediate(&mut self) {
+        pub fn alu_with_immediate(&mut self, alu: I8080AluCode) {
             self.fetch_instruction();
             self.tmp_reg().load_from_data();
-            self.alu_add();
+            self.alu_op(self.alu_from_code(alu));
             self.acc_reg().load_from_data();
+        }
+
+        pub fn cmp_with_reg(&mut self, rhs: I8080RegisterCode) {
+            use I8080AluCode::Sub;
+            self.code_reg_mut(rhs).read_to_data();
+            self.tmp_reg().load_from_data();
+            self.alu_op(self.alu_from_code(Sub));
+        }
+
+        pub fn cmp_with_mem(&mut self) {
+            use I8080AluCode::Sub;
+            self.fetch_hl();
+            self.tmp_reg().load_from_data();
+            self.alu_op(self.alu_from_code(Sub));
+        }
+
+        pub fn cmp_with_immediate(&mut self) {
+            use I8080AluCode::Sub;
+            self.fetch_instruction();
+            self.tmp_reg().load_from_data();
+            self.alu_op(self.alu_from_code(Sub));
+        }
+
+        /// practically used for Carry Flag.
+        pub fn flag_complement(&mut self, flag: StatusFlag) {
+            use I8080RegisterCode::Flag;
+            let status = self.flag_status();
+            let mut flag_reg = self.code_reg_mut(Flag).reg.masked(Self::flag_decode(flag));
+            if status.contains(flag) {
+                flag_reg.load(0)
+            } else {
+                flag_reg.load(!0)
+            }
+        }
+
+        /// practically used for Carry Flag.
+        pub fn flag_set(&mut self, flag: StatusFlag) {
+            use I8080RegisterCode::Flag;
+            self.code_reg_mut(Flag)
+                .reg
+                .masked(Self::flag_decode(flag))
+                .load(!0);
         }
     }
 
@@ -482,21 +593,37 @@ pub mod i8080 {
 
     #[test]
     fn alu() {
+        use I8080AluCode::*;
         use I8080RegisterCode::*;
         use StatusFlag::*;
         let mut c = I8080Console::default();
         c.acc_reg().reg.load(20);
         c.code_reg_mut(B).reg.load(30);
-        c.add_with_reg(B);
+        c.alu_with_reg(Add, B);
         assert_eq!(c.acc_reg().reg.read(), 50);
         c.acc_reg().reg.load(192);
         c.code_reg_mut(B).reg.load(64);
-        c.add_with_reg(B);
+        c.alu_with_reg(Add, B);
         assert_eq!(c.acc_reg().reg.read(), 0);
         assert_eq!(
             I8080Console::flag_collect(c.code_reg_mut(Flag).reg.read()),
             Carry | Parity | Zero,
         );
         assert_eq!(c.code_reg_mut(Flag).reg.read(), 0b0100_0111);
+        c.flag_complement(Carry);
+        assert_eq!(
+            I8080Console::flag_collect(c.code_reg_mut(Flag).reg.read()),
+            Parity | Zero,
+        );
+        c.flag_complement(Carry);
+        assert_eq!(
+            I8080Console::flag_collect(c.code_reg_mut(Flag).reg.read()),
+            Carry | Parity | Zero,
+        );
+        c.flag_set(AuxiliaryCarry);
+        assert_eq!(
+            I8080Console::flag_collect(c.code_reg_mut(Flag).reg.read()),
+            AuxiliaryCarry | Carry | Parity | Zero,
+        );
     }
 }

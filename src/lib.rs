@@ -6,7 +6,7 @@ pub mod alu;
 
 pub mod memory;
 
-pub mod cpu;
+pub mod processor;
 
 pub mod instruction {
     pub trait Instruction<C> {

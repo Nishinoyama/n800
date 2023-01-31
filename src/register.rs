@@ -36,7 +36,7 @@ impl<'a, R: Register> Register for MaskedRegister<'a, R> {
 pub mod bit8 {
     use crate::register::Register;
 
-    #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+    #[derive(Debug, Clone, Eq, PartialEq, Default)]
     pub struct Register8 {
         bits: u8,
     }
@@ -47,7 +47,7 @@ pub mod bit8 {
         }
     }
 
-    #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+    #[derive(Debug, Clone, Eq, PartialEq, Default)]
     pub struct Register8Pair {
         h: Register8,
         l: Register8,
@@ -57,11 +57,14 @@ pub mod bit8 {
         pub fn new(h: Register8, l: Register8) -> Self {
             Self { h, l }
         }
-        pub fn from_tuple((h, l): (Register8, Register8)) -> Self {
-            Self { h, l }
+        pub fn split(self) -> [Register8; 2] {
+            [self.h, self.l]
         }
-        pub fn split(self) -> (Register8, Register8) {
-            (self.h, self.l)
+        pub fn h_mut(&mut self) -> &mut Register8 {
+            &mut self.h
+        }
+        pub fn l_mut(&mut self) -> &mut Register8 {
+            &mut self.h
         }
         pub fn increment(&mut self) {
             let hl = self.as_u16();
@@ -117,13 +120,12 @@ pub mod bit8 {
             let mut reg16 = Register8Pair::new(Register8::new(10), Register8::new(32));
             assert_eq!(reg16.read(), 2592);
             reg16.load(3141);
-            let mut reg16 = Register8Pair::from_tuple(reg16.split());
             assert_eq!(reg16.read(), 3141);
             reg16.increment();
             assert_eq!(reg16.read(), 3142);
             reg16.decrement();
             assert_eq!(reg16.read(), 3141);
-            let (h, l) = reg16.split();
+            let [h, l] = reg16.split();
             assert_eq!(h.read(), 12);
             assert_eq!(l.read(), 69);
         }

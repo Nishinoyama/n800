@@ -1,53 +1,29 @@
-pub trait DataBus {
-    type Data;
-    fn set_data(&mut self, data: Self::Data);
-    fn get_data(&self) -> Self::Data;
-}
-
-pub trait AddressBus {
-    type Address;
-    fn set_address(&mut self, data: Self::Address);
-    fn get_address(&self) -> Self::Address;
-}
-
-/// Be connected to data bus and can load data from it.
-pub trait DataBusLoad {
-    type DataBus: DataBus;
-    fn load_from_data(&mut self);
-}
-
-/// Be connected to data bus and can write data to it.
-pub trait DataBusRead {
-    type DataBus: DataBus;
-    fn read_to_data(&self);
-}
-
-/// Be connected to address bus and can load address from it.
-pub trait AddressBusLoad {
-    type AddressBus: AddressBus;
-    fn load_address(&mut self);
-}
-
-/// Be connected to address bus and can write address to it.
-pub trait AddressBusRead {
-    type AddressBus: AddressBus;
-    fn read_address(&self);
-}
-
 /// Processor that can fetch data from its memory and make it store data.
 pub trait ProcMemory {
     fn store(&mut self);
     fn fetch(&mut self);
 }
 
+pub trait ProcInstructionFetch {
+    fn fetch_instruction(&mut self);
+}
+
+pub trait ProcImmediateValue: ProcInstructionFetch {
+    fn fetch_immediate_value(&mut self) {
+        self.fetch_instruction();
+    }
+}
+
 pub mod i8080 {
     use crate::alu::bit8::{Adder, DecimalAdjuster, IncDecOperator, LogicalOperator, Rotator};
     use crate::alu::{StatusFlag, ALU};
+    use crate::bus::{AddressBus, DataBus, DataBusLoad, DataBusRead};
     use crate::memory::{Memory, RamB8A16};
-    use crate::processor::{AddressBus, DataBus, DataBusLoad, DataBusRead, ProcMemory};
+    use crate::processor::ProcMemory;
     use crate::register::bit8::{Register8, Register8Pair};
     use crate::register::Register;
     use enumset::EnumSet;
+    use std::borrow::BorrowMut;
     use std::cell::Cell;
     use std::collections::HashMap;
     use std::io::Read;
@@ -105,9 +81,7 @@ pub mod i8080 {
         address_bus: Rc<Cell<u16>>,
         memory: RamB8A16,
         regs: HashMap<I8080RegisterCode, I8080DataReg>,
-        inst_reg: Register8,
-        pc_reg: Register8Pair,
-        sp_reg: Register8Pair,
+        halted: bool,
     }
 
     #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -122,6 +96,10 @@ pub mod i8080 {
         L,
         Tmp,
         Inst,
+        PcH,
+        PcL,
+        SpH,
+        SpL,
         W,
         Z,
     }
@@ -161,6 +139,8 @@ pub mod i8080 {
                 DE => [D, E],
                 HL => [H, L],
                 WZ => [W, Z],
+                SP => [SpH, SpL],
+                PC => [PcH, PcL],
                 other => panic!("{:?} Can't be Split", other),
             }
         }
@@ -205,29 +185,13 @@ pub mod i8080 {
                 .unwrap_or_else(|| 0)
         }
         fn code_reg16_as_u16(&self, code: I8080RegisterCode16) -> u16 {
-            if code == I8080RegisterCode16::SP {
-                self.sp_reg.as_u16()
-            } else if code == I8080RegisterCode16::PC {
-                self.pc_reg.as_u16()
-            } else {
-                u16::from_be_bytes(code.split().map(|c| self.code_reg_as_u8(c)))
-            }
+            u16::from_be_bytes(code.split().map(|c| self.code_reg_as_u8(c)))
         }
-        fn load_code_reg16_from_wz(&mut self, code: I8080RegisterCode16) {
-            use I8080RegisterCode::{W, Z};
-            let [h, l] = code.split();
-            self.code_reg_mut(W).read_to_data();
-            self.code_reg_mut(h).load_from_data();
-            self.code_reg_mut(Z).read_to_data();
-            self.code_reg_mut(l).load_from_data();
-        }
-        fn load_wz_from_code_reg16(&mut self, code: I8080RegisterCode16) {
-            use I8080RegisterCode::{W, Z};
-            let [h, l] = code.split();
-            self.code_reg_mut(h).read_to_data();
-            self.code_reg_mut(W).load_from_data();
-            self.code_reg_mut(l).read_to_data();
-            self.code_reg_mut(Z).load_from_data();
+        fn load_reg16_from_reg16(&mut self, dst: I8080RegisterCode16, src: I8080RegisterCode16) {
+            dst.split().into_iter().zip(src.split()).for_each(|(d, s)| {
+                self.code_reg_mut(s).read_to_data();
+                self.code_reg_mut(d).load_from_data();
+            })
         }
         fn acc_reg(&mut self) -> &mut I8080DataReg {
             use I8080RegisterCode::Acc;
@@ -255,22 +219,44 @@ pub mod i8080 {
             self.fetch_instruction();
             self.code_reg_mut(W).load_from_data();
         }
-        // fixme: unclean
         fn reg16_increment(&mut self, dst: I8080RegisterCode16) {
-            use I8080RegisterCode16::{PC, SP};
-            match dst {
-                SP => self.sp_reg.increment(),
-                PC => self.pc_reg.increment(),
-                _ => {
-                    let [h, l] = dst.split();
-                    let mut wz =
-                        Register8Pair::new(self.code_reg_mut(h).reg, self.code_reg_mut(l).reg);
-                    wz.increment();
-                    let (w, z) = wz.split();
-                    self.regs.get_mut(&h).unwrap().reg.load(w.read());
-                    self.regs.get_mut(&l).unwrap().reg.load(z.read());
-                }
-            }
+            let [h, l] = dst
+                .split()
+                .map(|c| self.regs.remove(&c).map(|r| r.reg).unwrap_or_default());
+            let mut inc = Register8Pair::new(h, l);
+            inc.increment();
+            dst.split()
+                .into_iter()
+                .zip(inc.split())
+                .for_each(|(c, reg)| {
+                    self.regs.insert(
+                        c,
+                        I8080DataReg {
+                            reg,
+                            bus: Rc::clone(&self.data_bus),
+                        },
+                    );
+                })
+        }
+
+        fn reg16_decrement(&mut self, dst: I8080RegisterCode16) {
+            let [h, l] = dst
+                .split()
+                .map(|c| self.regs.remove(&c).map(|r| r.reg).unwrap_or_default());
+            let mut inc = Register8Pair::new(h, l);
+            inc.decrement();
+            dst.split()
+                .into_iter()
+                .zip(inc.split())
+                .for_each(|(c, reg)| {
+                    self.regs.insert(
+                        c,
+                        I8080DataReg {
+                            reg,
+                            bus: Rc::clone(&self.data_bus),
+                        },
+                    );
+                })
         }
 
         #[must_use]
@@ -288,7 +274,7 @@ pub mod i8080 {
             use I8080RegisterCode16::PC;
             self.code_reg16_read_to_address(PC);
             self.fetch();
-            self.pc_reg.increment();
+            self.reg16_increment(PC);
         }
 
         pub fn move_reg_to_reg(&mut self, dst: I8080RegisterCode, src: I8080RegisterCode) {
@@ -324,8 +310,8 @@ pub mod i8080 {
 
         /// special
         pub fn move_sp_from_hl(&mut self) {
-            use I8080RegisterCode16::HL;
-            self.sp_reg.load(self.code_reg16_as_u16(HL));
+            use I8080RegisterCode16::{HL, SP};
+            self.load_reg16_from_reg16(SP, HL);
         }
 
         pub fn move_reg16_immediate(&mut self, dst: I8080RegisterCode16) {
@@ -604,32 +590,34 @@ pub mod i8080 {
         }
 
         pub fn jump_immediate(&mut self, cond: I8080JumpCondition) {
-            use I8080RegisterCode16::WZ;
+            use I8080RegisterCode16::{PC, WZ};
             self.fetch_operand_to_wz();
             if self.satisfying_condition(cond) {
-                self.pc_reg.load(self.code_reg16_as_u16(WZ));
+                self.load_reg16_from_reg16(PC, WZ);
             }
         }
 
         pub fn call_immediate(&mut self, cond: I8080JumpCondition) {
-            use I8080RegisterCode16::{SP, WZ};
+            use I8080RegisterCode16::{PC, SP, WZ};
             self.fetch_operand_to_wz();
             if self.satisfying_condition(cond) {
-                let [pch, pcl] = self.pc_reg.as_u16().to_be_bytes();
-                self.sp_reg.decrement();
-                self.data_bus.set(pch);
+                let [pch, pcl] = PC.split();
+                self.reg16_increment(SP);
+                self.code_reg_mut(pch).read_to_data();
                 self.code_reg16_read_to_address(SP);
                 self.store();
-                self.sp_reg.decrement();
-                self.data_bus.set(pcl);
+
+                self.reg16_decrement(SP);
+                self.code_reg_mut(pcl).read_to_data();
                 self.code_reg16_read_to_address(SP);
                 self.store();
-                self.pc_reg.load(self.code_reg16_as_u16(WZ));
+
+                self.load_reg16_from_reg16(PC, WZ);
             }
         }
         pub fn ret(&mut self, cond: I8080JumpCondition) {
             use I8080RegisterCode::{W, Z};
-            use I8080RegisterCode16::{SP, WZ};
+            use I8080RegisterCode16::{PC, SP, WZ};
             if self.satisfying_condition(cond) {
                 self.code_reg16_read_to_address(SP);
                 self.fetch();
@@ -641,88 +629,87 @@ pub mod i8080 {
                 self.code_reg_mut(W).load_from_data();
                 self.reg16_increment(SP);
 
-                self.pc_reg.load(self.code_reg16_as_u16(WZ));
+                self.load_reg16_from_reg16(PC, WZ);
             }
         }
 
         /// restart, that equals `call n*8`
         pub fn restart(&mut self, n: u8) {
-            use I8080RegisterCode::{W, Z};
-            use I8080RegisterCode16::{SP, WZ};
+            use I8080RegisterCode16::{PC, SP, WZ};
             let [pch, pcl] = [0, n * 8];
-            self.sp_reg.decrement();
+            self.reg16_decrement(SP);
             self.data_bus.set(pch);
             self.code_reg16_read_to_address(SP);
             self.store();
-            self.sp_reg.decrement();
+
+            self.reg16_decrement(SP);
             self.data_bus.set(pcl);
             self.code_reg16_read_to_address(SP);
             self.store();
-            self.pc_reg.load(self.code_reg16_as_u16(WZ));
+
+            self.load_reg16_from_reg16(PC, WZ);
         }
 
         /// special, pchl
         pub fn pchl(&mut self) {
-            use I8080RegisterCode16::HL;
-            self.pc_reg.load(self.code_reg16_as_u16(HL));
+            use I8080RegisterCode16::{HL, PC};
+            self.load_reg16_from_reg16(PC, HL);
         }
 
         pub fn push_reg16(&mut self, code: I8080RegisterCode16) {
             use I8080RegisterCode16::SP;
-            let [h, l] = self.code_reg16_as_u16(code).to_be_bytes();
-            self.sp_reg.decrement();
-            self.data_bus.set(h);
+            let [h, l] = code.split();
+            self.reg16_decrement(SP);
+            self.code_reg_mut(h).read_to_data();
             self.code_reg16_read_to_address(SP);
             self.store();
-            self.sp_reg.decrement();
-            self.data_bus.set(l);
+
+            self.reg16_decrement(SP);
+            self.code_reg_mut(l).read_to_data();
             self.code_reg16_read_to_address(SP);
             self.store();
         }
 
         pub fn pop_reg16(&mut self, code: I8080RegisterCode16) {
             use I8080RegisterCode16::{PC, SP};
+            let [h, l] = code.split();
             self.code_reg16_read_to_address(SP);
             self.fetch();
-            let h = self.data_bus.get();
-            self.sp_reg.increment();
+            self.code_reg_mut(h).load_from_data();
+            self.reg16_increment(SP);
+
             self.code_reg16_read_to_address(SP);
             self.fetch();
-            let l = self.data_bus.get();
-            self.sp_reg.increment();
-            match code {
-                PC => self.pc_reg.load(u16::from_be_bytes([h, l])),
-                other => other.split().into_iter().zip([h, l]).for_each(|(c, x)| {
-                    self.code_reg_mut(c).reg.load(x);
-                }),
-            }
+            self.code_reg_mut(l).load_from_data();
+            self.reg16_increment(SP);
         }
 
+        /// special
         pub fn exchange_stack_top_with_hl(&mut self) {
-            use I8080RegisterCode::{H, L};
-            use I8080RegisterCode16::{HL, SP};
+            use I8080RegisterCode::{H, L, W, Z};
+            use I8080RegisterCode16::{HL, SP, WZ};
             let [h, l] = self.code_reg16_as_u16(HL).to_be_bytes();
 
             self.code_reg16_read_to_address(SP);
             self.fetch();
-            self.code_reg_mut(L).load_from_data();
-            self.data_bus.set(l);
+            self.code_reg_mut(Z).load_from_data();
+            self.code_reg_mut(L).read_to_data();
             self.store();
-            self.sp_reg.increment();
+            self.reg16_increment(SP);
 
             self.code_reg16_read_to_address(SP);
             self.fetch();
-            self.code_reg_mut(H).load_from_data();
-            self.data_bus.set(h);
+            self.code_reg_mut(W).load_from_data();
+            self.code_reg_mut(H).read_to_data();
             self.store();
-            self.sp_reg.decrement();
+            self.reg16_decrement(SP);
+            self.load_reg16_from_reg16(HL, WZ);
         }
 
+        /// special
         pub fn sphl(&mut self) {
-            use I8080RegisterCode::{H, L};
             use I8080RegisterCode16::{HL, SP};
-            let hl = self.code_reg16_as_u16(HL);
-            self.sp_reg.load(hl);
+            self.load_reg16_from_reg16(SP, HL)
         }
 
         /// special
@@ -754,7 +741,9 @@ pub mod i8080 {
         pub fn disable_interrupt(&mut self) {}
 
         /// special
-        pub fn halt(&mut self) {}
+        pub fn halt(&mut self) {
+            self.halted = true;
+        }
 
         /// special
         pub fn no_op(&mut self) {}
@@ -805,9 +794,9 @@ pub mod i8080 {
             use I8080RegisterCode::*;
             use I8080RegisterCode16::*;
             self.fetch_instruction();
-            self.inst_reg.load(self.data_bus.get());
+            self.code_reg_mut(Inst).load_from_data();
             let (op, dst, src) = {
-                let inst = self.inst_reg.read();
+                let inst = self.code_reg_mut(Inst).reg.read();
                 ((inst >> 6), (inst >> 3) & 0x7, inst & 0x7)
             };
             match op {
@@ -849,7 +838,7 @@ pub mod i8080 {
                     (dst, 6) => self.move_reg_immediate(Self::reg_code_from_bits(dst)),
                     (rhs, 1) if rhs % 2 == 1 => {
                         let hl = self.code_reg16_as_u16(HL);
-                        let rp = self.code_reg16_as_u16(Self::reg16_code_from_bits(rhs));
+                        let rp = self.code_reg16_as_u16(Self::reg16_code_from_bits(rhs / 2));
                         let (res, carry) = hl.overflowing_add(rp);
                         if carry {
                             self.code_reg_mut(Flag)
@@ -935,6 +924,13 @@ pub mod i8080 {
                     _ => self.no_op(),
                 },
                 _ => unreachable!(),
+            }
+        }
+
+        pub fn run(&mut self) {
+            self.halted = false;
+            while !self.halted {
+                self.execute();
             }
         }
     }
@@ -1026,5 +1022,19 @@ pub mod i8080 {
             I8080Console::flag_collect(c.code_reg_mut(Flag).reg.read()),
             AuxiliaryCarry | Carry | Parity | Zero,
         );
+    }
+
+    #[test]
+    fn run() {
+        use I8080RegisterCode16::PC;
+        let mut memory = RamB8A16::default();
+        memory.flash(&(0..=255u8).cycle().take(65535).collect::<Vec<_>>(), 0);
+        let mut c = I8080Console {
+            memory,
+            ..Default::default()
+        };
+        c.run();
+        println!("{:?}", c);
+        println!("{}", c.code_reg16_as_u16(PC));
     }
 }

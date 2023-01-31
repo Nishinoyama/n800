@@ -8,6 +8,8 @@ pub mod memory;
 
 pub mod processor;
 
+pub mod bus;
+
 pub mod instruction {
     pub trait Instruction<C> {
         fn execute(&self, cpu: &mut C);

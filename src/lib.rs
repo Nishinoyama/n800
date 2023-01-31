@@ -10,24 +10,4 @@ pub mod processor;
 
 pub mod bus;
 
-pub mod instruction {
-    pub trait Instruction<C> {
-        fn execute(&self, cpu: &mut C);
-    }
-}
-
-pub mod interact {
-    use std::collections::HashMap;
-
-    #[derive(Default)]
-    struct C {
-        d: u8,
-        a: u8,
-        b: u8,
-        c: u8,
-    }
-    #[derive(Default)]
-    struct M {
-        data: HashMap<u8, u8>,
-    }
-}
+pub mod instruction;

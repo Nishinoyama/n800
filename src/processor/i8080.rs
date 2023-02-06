@@ -13,6 +13,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::Read;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct I8080DataReg {
@@ -61,10 +62,10 @@ impl AddressBus for u16 {
 }
 
 #[derive(Default, Debug)]
-pub struct I8080Console {
+pub struct I8080Console<M> {
     data_bus: Rc<Cell<u8>>,
     address_bus: Rc<Cell<u16>>,
-    memory: RamB8A16,
+    memory: Arc<Mutex<M>>,
     regs: HashMap<I8080RegisterCode, I8080DataReg>,
     halted: bool,
 }
@@ -165,12 +166,7 @@ pub enum I8080JumpCondition {
     OnMinus,
 }
 
-#[deny(unused_must_use)]
-impl I8080Console {
-    pub fn flash(&mut self, data: &[u8]) {
-        self.memory.flash(data, 0);
-    }
-
+impl<M> I8080Console<M> {
     fn code_reg_as_u8(&self, code: I8080RegisterCode) -> u8 {
         self.regs
             .get(&code)
@@ -186,6 +182,13 @@ impl I8080Console {
             self.code_reg_mut(d).load_from_data();
         })
     }
+    #[must_use]
+    pub fn code_reg_mut(&mut self, code: I8080RegisterCode) -> &mut I8080DataReg {
+        self.regs.entry(code).or_insert_with(|| I8080DataReg {
+            reg: Default::default(),
+            bus: Rc::clone(&self.data_bus),
+        })
+    }
     fn acc_reg(&mut self) -> &mut I8080DataReg {
         use I8080RegisterCode::Acc;
         self.code_reg_mut(Acc)
@@ -193,24 +196,6 @@ impl I8080Console {
     fn tmp_reg(&mut self) -> &mut I8080DataReg {
         use I8080RegisterCode::Tmp;
         self.code_reg_mut(Tmp)
-    }
-    fn store_hl(&mut self) {
-        use I8080RegisterCode16::HL;
-        self.code_reg16_read_to_address(HL);
-        self.store()
-    }
-    fn fetch_hl(&mut self) {
-        use I8080RegisterCode16::HL;
-        self.code_reg16_read_to_address(HL);
-        self.fetch()
-    }
-    fn fetch_operand_to_wz(&mut self) {
-        use I8080RegisterCode::{W, Z};
-        // little endian
-        self.fetch_instruction();
-        self.code_reg_mut(Z).load_from_data();
-        self.fetch_instruction();
-        self.code_reg_mut(W).load_from_data();
     }
     fn reg16_increment(&mut self, dst: I8080RegisterCode16) {
         let [h, l] = dst
@@ -236,11 +221,11 @@ impl I8080Console {
         let [h, l] = dst
             .split()
             .map(|c| self.regs.remove(&c).map(|r| r.reg).unwrap_or_default());
-        let mut inc = Register8Pair::new(h, l);
-        inc.decrement();
+        let mut dec = Register8Pair::new(h, l);
+        dec.decrement();
         dst.split()
             .into_iter()
-            .zip(inc.split())
+            .zip(dec.split())
             .for_each(|(c, reg)| {
                 self.regs.insert(
                     c,
@@ -251,30 +236,263 @@ impl I8080Console {
                 );
             })
     }
-
-    #[must_use]
-    pub fn code_reg_mut(&mut self, code: I8080RegisterCode) -> &mut I8080DataReg {
-        self.regs.entry(code).or_insert_with(|| I8080DataReg {
-            reg: Default::default(),
-            bus: Rc::clone(&self.data_bus),
-        })
-    }
     pub fn code_reg16_read_to_address(&self, code: I8080RegisterCode16) {
         self.address_bus.set(self.code_reg16_as_u16(code))
     }
+    pub fn move_reg_to_reg(&mut self, dst: I8080RegisterCode, src: I8080RegisterCode) {
+        self.code_reg_mut(src).read_to_data();
+        self.code_reg_mut(dst).load_from_data();
+    }
+    pub fn move_rp_to_rp(&mut self, dst: I8080RegisterCode16, src: I8080RegisterCode16) {
+        dst.split().into_iter().zip(src.split()).for_each(|(d, s)| {
+            self.code_reg_mut(s).read_to_data();
+            self.code_reg_mut(d).load_from_data();
+        })
+    }
+    fn exchange8(&mut self, dst: I8080RegisterCode, src: I8080RegisterCode) {
+        let src_tmp = self.code_reg_mut(src).reg.read();
+        let dst_tmp = self.code_reg_mut(dst).reg.read();
+        self.code_reg_mut(src).reg.load(dst_tmp);
+        self.code_reg_mut(dst).reg.load(src_tmp);
+    }
+    /// special
+    pub fn exchange16(&mut self, dst: I8080RegisterCode16, src: I8080RegisterCode16) {
+        for (d, s) in dst.split().into_iter().zip(src.split()) {
+            self.exchange8(d, s)
+        }
+    }
 
+    fn flag_scramble(status: EnumSet<StatusFlag>) -> u8 {
+        status
+            .into_iter()
+            .fold(2, |acc, f| acc + Self::flag_decode(f))
+    }
+
+    fn flag_collect(flags: u8) -> EnumSet<StatusFlag> {
+        EnumSet::all()
+            .into_iter()
+            .filter(|&f| Self::flag_decode(f) & flags > 0)
+            .collect()
+    }
+
+    fn flag_status(&self) -> EnumSet<StatusFlag> {
+        use I8080RegisterCode::Flag;
+        Self::flag_collect(
+            self.regs
+                .get(&Flag)
+                .map(|r| r.reg.read())
+                .unwrap_or_default(),
+        )
+    }
+
+    fn flag_decode(flag: StatusFlag) -> u8 {
+        match flag {
+            StatusFlag::Zero => 64,
+            StatusFlag::Sign => 128,
+            StatusFlag::Parity => 4,
+            StatusFlag::Carry => 1,
+            StatusFlag::AuxiliaryCarry => 16,
+        }
+    }
+
+    fn alu_from_code(&self, code: I8080AluCode) -> Box<dyn ALU<Data = u8, Flag = StatusFlag>> {
+        use I8080AluCode::*;
+        use StatusFlag::Carry;
+        match code {
+            Add => Box::new(Adder::adder()),
+            AddCarried => {
+                if self.flag_status().contains(Carry) {
+                    Box::new(Adder::carried_adder())
+                } else {
+                    Box::new(Adder::adder())
+                }
+            }
+            Sub => Box::new(Adder::subber()),
+            SubBorrowed => {
+                if self.flag_status().contains(Carry) {
+                    Box::new(Adder::borrowed_subber())
+                } else {
+                    Box::new(Adder::subber())
+                }
+            }
+            Increment => Box::new(IncDecOperator::Increase),
+            Decrement => Box::new(IncDecOperator::Decrease),
+            DecimalAdjust => Box::new(DecimalAdjuster::from_status(self.flag_status())),
+            LogicAnd => Box::new(LogicalOperator::And),
+            LogicOr => Box::new(LogicalOperator::Or),
+            LogicXor => Box::new(LogicalOperator::Xor),
+            RotateLeft => Box::new(Rotator::rotate_left()),
+            RotateRight => Box::new(Rotator::rotate_right()),
+            RotateLeftThroughCarry => Box::new(
+                Rotator::rotate_right()
+                    .through_carry()
+                    .carried(self.flag_status().contains(Carry)),
+            ),
+            RotateRightThroughCarry => Box::new(
+                Rotator::rotate_left()
+                    .through_carry()
+                    .carried(self.flag_status().contains(Carry)),
+            ),
+            ComplementAcc => Box::new(LogicalOperator::Not),
+        }
+    }
+
+    fn alu_op(&mut self, alu: Box<dyn ALU<Data = u8, Flag = StatusFlag>>) {
+        use I8080RegisterCode::Flag;
+        let (res, flag) = alu.op(self.acc_reg().reg.read(), self.tmp_reg().reg.read());
+        self.data_bus.set(res);
+        self.code_reg_mut(Flag).reg.load(Self::flag_scramble(flag));
+    }
+
+    pub fn alu_with_reg(&mut self, alu: I8080AluCode, rhs: I8080RegisterCode) {
+        self.code_reg_mut(rhs).read_to_data();
+        self.tmp_reg().load_from_data();
+        self.alu_op(self.alu_from_code(alu));
+        self.acc_reg().load_from_data();
+    }
+
+    pub fn alu_with_reg_to_reg(&mut self, alu: I8080AluCode, rhs: I8080RegisterCode) {
+        self.code_reg_mut(rhs).read_to_data();
+        self.tmp_reg().load_from_data();
+        self.alu_op(self.alu_from_code(alu));
+        self.code_reg_mut(rhs).load_from_data();
+    }
+
+    pub fn cmp_with_reg(&mut self, rhs: I8080RegisterCode) {
+        use I8080AluCode::Sub;
+        self.code_reg_mut(rhs).read_to_data();
+        self.tmp_reg().load_from_data();
+        self.alu_op(self.alu_from_code(Sub));
+    }
+
+    /// practically used for Carry Flag.
+    pub fn flag_complement(&mut self, flag: StatusFlag) {
+        use I8080RegisterCode::Flag;
+        let status = self.flag_status();
+        let mut flag_reg = self.code_reg_mut(Flag).reg.masked(Self::flag_decode(flag));
+        if status.contains(flag) {
+            flag_reg.load(0)
+        } else {
+            flag_reg.load(!0)
+        }
+    }
+
+    /// practically used for Carry Flag.
+    pub fn flag_set(&mut self, flag: StatusFlag) {
+        use I8080RegisterCode::Flag;
+        self.code_reg_mut(Flag)
+            .reg
+            .masked(Self::flag_decode(flag))
+            .load(!0);
+    }
+
+    fn flag_objected_by(cond: I8080JumpCondition) -> (StatusFlag, bool) {
+        use I8080JumpCondition::*;
+        use StatusFlag::*;
+        match cond {
+            OnNonZero => (Zero, false),
+            OnZero => (Zero, true),
+            OnNonCarry => (Carry, false),
+            OnCarry => (Carry, true),
+            OnParityOdd => (Parity, false),
+            OnParityEven => (Parity, true),
+            OnPlus => (Sign, false),
+            OnMinus => (Sign, true),
+            _ => unreachable!(),
+        }
+    }
+
+    fn satisfying_condition(&mut self, cond: I8080JumpCondition) -> bool {
+        use I8080JumpCondition::*;
+        let set = |cond| {
+            let (flag, set) = Self::flag_objected_by(cond);
+            self.flag_status().contains(flag) == set
+        };
+        match cond {
+            Anytime => true,
+            other => set(other),
+        }
+    }
+
+    /// special
+    pub fn enable_interrupt(&mut self) {}
+
+    /// special
+    pub fn disable_interrupt(&mut self) {}
+
+    /// special
+    pub fn halt(&mut self) {
+        self.halted = true;
+    }
+
+    /// special
+    pub fn no_op(&mut self) {}
+
+    fn reg16_code_from_bits(bits: u8) -> I8080RegisterCode16 {
+        use I8080RegisterCode16::*;
+        match bits {
+            0 => BC,
+            1 => DE,
+            2 => HL,
+            3 => SP,
+            _ => unreachable!(),
+        }
+    }
+
+    fn reg_code_from_bits(bits: u8) -> I8080RegisterCode {
+        use I8080RegisterCode::*;
+        match bits {
+            0 => B,
+            1 => C,
+            2 => D,
+            3 => E,
+            4 => H,
+            5 => L,
+            7 => Acc,
+            _ => unreachable!(),
+        }
+    }
+
+    fn condition_code_from_bits(bits: u8) -> I8080JumpCondition {
+        use I8080JumpCondition::*;
+        match bits {
+            0 => OnNonZero,
+            1 => OnZero,
+            2 => OnNonCarry,
+            3 => OnCarry,
+            4 => OnParityOdd,
+            5 => OnParityEven,
+            6 => OnPlus,
+            7 => OnMinus,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl<M: Memory<Data = u8, Address = u16>> I8080Console<M> {
+    fn store_hl(&mut self) {
+        use I8080RegisterCode16::HL;
+        self.code_reg16_read_to_address(HL);
+        self.store()
+    }
+    fn fetch_hl(&mut self) {
+        use I8080RegisterCode16::HL;
+        self.code_reg16_read_to_address(HL);
+        self.fetch()
+    }
+    fn fetch_operand_to_wz(&mut self) {
+        use I8080RegisterCode::{W, Z};
+        // little endian
+        self.fetch_instruction();
+        self.code_reg_mut(Z).load_from_data();
+        self.fetch_instruction();
+        self.code_reg_mut(W).load_from_data();
+    }
     pub fn fetch_instruction(&mut self) {
         use I8080RegisterCode16::PC;
         self.code_reg16_read_to_address(PC);
         self.fetch();
         self.reg16_increment(PC);
-    }
-
-    pub fn move_reg_to_reg(&mut self, dst: I8080RegisterCode, src: I8080RegisterCode) {
-        self.code_reg_mut(src).read_to_data();
-        self.tmp_reg().load_from_data();
-        self.tmp_reg().read_to_data();
-        self.code_reg_mut(dst).load_from_data();
     }
 
     pub fn move_hl_mem_to_reg(&mut self, dst: I8080RegisterCode) {
@@ -284,8 +502,6 @@ impl I8080Console {
 
     pub fn store_reg_to_hl_mem(&mut self, src: I8080RegisterCode) {
         self.code_reg_mut(src).read_to_data();
-        self.tmp_reg().load_from_data();
-        self.tmp_reg().read_to_data();
         self.store_hl();
     }
 
@@ -296,15 +512,7 @@ impl I8080Console {
 
     pub fn store_hl_immediate(&mut self) {
         self.fetch_instruction();
-        self.tmp_reg().load_from_data();
-        self.tmp_reg().read_to_data();
         self.store_hl();
-    }
-
-    /// special
-    pub fn move_sp_from_hl(&mut self) {
-        use I8080RegisterCode16::{HL, SP};
-        self.load_reg16_from_reg16(SP, HL);
     }
 
     pub fn move_reg16_immediate(&mut self, dst: I8080RegisterCode16) {
@@ -381,116 +589,6 @@ impl I8080Console {
         self.store();
     }
 
-    fn exchange8(&mut self, dst: I8080RegisterCode, src: I8080RegisterCode) {
-        let src_tmp = self.code_reg_mut(src).reg.read();
-        let dst_tmp = self.code_reg_mut(dst).reg.read();
-        self.code_reg_mut(src).reg.load(dst_tmp);
-        self.code_reg_mut(dst).reg.load(src_tmp);
-    }
-
-    /// special
-    pub fn exchange16(&mut self, dst: I8080RegisterCode16, src: I8080RegisterCode16) {
-        for (d, s) in dst.split().into_iter().zip(src.split()) {
-            self.exchange8(d, s)
-        }
-    }
-
-    fn flag_decode(flag: StatusFlag) -> u8 {
-        match flag {
-            StatusFlag::Zero => 64,
-            StatusFlag::Sign => 128,
-            StatusFlag::Parity => 4,
-            StatusFlag::Carry => 1,
-            StatusFlag::AuxiliaryCarry => 16,
-        }
-    }
-
-    fn flag_scramble(status: EnumSet<StatusFlag>) -> u8 {
-        status
-            .into_iter()
-            .fold(2, |acc, f| acc + Self::flag_decode(f))
-    }
-
-    fn flag_collect(flags: u8) -> EnumSet<StatusFlag> {
-        EnumSet::all()
-            .into_iter()
-            .filter(|&f| Self::flag_decode(f) & flags > 0)
-            .collect()
-    }
-
-    fn flag_status(&self) -> EnumSet<StatusFlag> {
-        use I8080RegisterCode::Flag;
-        Self::flag_collect(
-            self.regs
-                .get(&Flag)
-                .map(|r| r.reg.read())
-                .unwrap_or_default(),
-        )
-    }
-
-    fn alu_from_code(&self, code: I8080AluCode) -> Box<dyn ALU<Data = u8, Flag = StatusFlag>> {
-        use I8080AluCode::*;
-        use StatusFlag::Carry;
-        match code {
-            Add => Box::new(Adder::adder()),
-            AddCarried => {
-                if self.flag_status().contains(Carry) {
-                    Box::new(Adder::carried_adder())
-                } else {
-                    Box::new(Adder::adder())
-                }
-            }
-            Sub => Box::new(Adder::subber()),
-            SubBorrowed => {
-                if self.flag_status().contains(Carry) {
-                    Box::new(Adder::borrowed_subber())
-                } else {
-                    Box::new(Adder::subber())
-                }
-            }
-            Increment => Box::new(IncDecOperator::Increase),
-            Decrement => Box::new(IncDecOperator::Decrease),
-            DecimalAdjust => Box::new(DecimalAdjuster::from_status(self.flag_status())),
-            LogicAnd => Box::new(LogicalOperator::And),
-            LogicOr => Box::new(LogicalOperator::Or),
-            LogicXor => Box::new(LogicalOperator::Xor),
-            RotateLeft => Box::new(Rotator::rotate_left()),
-            RotateRight => Box::new(Rotator::rotate_right()),
-            RotateLeftThroughCarry => Box::new(
-                Rotator::rotate_right()
-                    .through_carry()
-                    .carried(self.flag_status().contains(Carry)),
-            ),
-            RotateRightThroughCarry => Box::new(
-                Rotator::rotate_left()
-                    .through_carry()
-                    .carried(self.flag_status().contains(Carry)),
-            ),
-            ComplementAcc => Box::new(LogicalOperator::Not),
-        }
-    }
-
-    fn alu_op(&mut self, alu: Box<dyn ALU<Data = u8, Flag = StatusFlag>>) {
-        use I8080RegisterCode::Flag;
-        let (res, flag) = alu.op(self.acc_reg().reg.read(), self.tmp_reg().reg.read());
-        self.data_bus.set(res);
-        self.code_reg_mut(Flag).reg.load(Self::flag_scramble(flag));
-    }
-
-    pub fn alu_with_reg(&mut self, alu: I8080AluCode, rhs: I8080RegisterCode) {
-        self.code_reg_mut(rhs).read_to_data();
-        self.tmp_reg().load_from_data();
-        self.alu_op(self.alu_from_code(alu));
-        self.acc_reg().load_from_data();
-    }
-
-    pub fn alu_with_reg_to_reg(&mut self, alu: I8080AluCode, rhs: I8080RegisterCode) {
-        self.code_reg_mut(rhs).read_to_data();
-        self.tmp_reg().load_from_data();
-        self.alu_op(self.alu_from_code(alu));
-        self.code_reg_mut(rhs).load_from_data();
-    }
-
     pub fn alu_with_mem(&mut self, alu: I8080AluCode) {
         self.fetch_hl();
         self.tmp_reg().load_from_data();
@@ -512,13 +610,6 @@ impl I8080Console {
         self.acc_reg().load_from_data();
     }
 
-    pub fn cmp_with_reg(&mut self, rhs: I8080RegisterCode) {
-        use I8080AluCode::Sub;
-        self.code_reg_mut(rhs).read_to_data();
-        self.tmp_reg().load_from_data();
-        self.alu_op(self.alu_from_code(Sub));
-    }
-
     pub fn cmp_with_mem(&mut self) {
         use I8080AluCode::Sub;
         self.fetch_hl();
@@ -531,55 +622,6 @@ impl I8080Console {
         self.fetch_instruction();
         self.tmp_reg().load_from_data();
         self.alu_op(self.alu_from_code(Sub));
-    }
-
-    /// practically used for Carry Flag.
-    pub fn flag_complement(&mut self, flag: StatusFlag) {
-        use I8080RegisterCode::Flag;
-        let status = self.flag_status();
-        let mut flag_reg = self.code_reg_mut(Flag).reg.masked(Self::flag_decode(flag));
-        if status.contains(flag) {
-            flag_reg.load(0)
-        } else {
-            flag_reg.load(!0)
-        }
-    }
-
-    /// practically used for Carry Flag.
-    pub fn flag_set(&mut self, flag: StatusFlag) {
-        use I8080RegisterCode::Flag;
-        self.code_reg_mut(Flag)
-            .reg
-            .masked(Self::flag_decode(flag))
-            .load(!0);
-    }
-
-    fn flag_objected_by(cond: I8080JumpCondition) -> (StatusFlag, bool) {
-        use I8080JumpCondition::*;
-        use StatusFlag::*;
-        match cond {
-            OnNonZero => (Zero, false),
-            OnZero => (Zero, true),
-            OnNonCarry => (Carry, false),
-            OnCarry => (Carry, true),
-            OnParityOdd => (Parity, false),
-            OnParityEven => (Parity, true),
-            OnPlus => (Sign, false),
-            OnMinus => (Sign, true),
-            _ => unreachable!(),
-        }
-    }
-
-    fn satisfying_condition(&mut self, cond: I8080JumpCondition) -> bool {
-        use I8080JumpCondition::*;
-        let set = |cond| {
-            let (flag, set) = Self::flag_objected_by(cond);
-            self.flag_status().contains(flag) == set
-        };
-        match cond {
-            Anytime => true,
-            other => set(other),
-        }
     }
 
     pub fn jump_immediate(&mut self, cond: I8080JumpCondition) {
@@ -643,12 +685,6 @@ impl I8080Console {
         self.load_reg16_from_reg16(PC, WZ);
     }
 
-    /// special, pchl
-    pub fn pchl(&mut self) {
-        use I8080RegisterCode16::{HL, PC};
-        self.load_reg16_from_reg16(PC, HL);
-    }
-
     pub fn push_reg16(&mut self, code: I8080RegisterCode16) {
         use I8080RegisterCode16::SP;
         let [h, l] = code.split();
@@ -664,7 +700,7 @@ impl I8080Console {
     }
 
     pub fn pop_reg16(&mut self, code: I8080RegisterCode16) {
-        use I8080RegisterCode16::{PC, SP};
+        use I8080RegisterCode16::SP;
         let [h, l] = code.split();
         self.code_reg16_read_to_address(SP);
         self.fetch();
@@ -681,7 +717,6 @@ impl I8080Console {
     pub fn exchange_stack_top_with_hl(&mut self) {
         use I8080RegisterCode::{H, L, W, Z};
         use I8080RegisterCode16::{HL, SP, WZ};
-        let [h, l] = self.code_reg16_as_u16(HL).to_be_bytes();
 
         self.code_reg16_read_to_address(SP);
         self.fetch();
@@ -700,12 +735,6 @@ impl I8080Console {
     }
 
     /// special
-    pub fn sphl(&mut self) {
-        use I8080RegisterCode16::{HL, SP};
-        self.load_reg16_from_reg16(SP, HL)
-    }
-
-    /// special
     pub fn input(&mut self) {
         self.fetch_instruction();
         let acc = match self.data_bus.get() {
@@ -721,64 +750,9 @@ impl I8080Console {
 
     /// special
     pub fn output(&mut self) {
-        use I8080RegisterCode::Acc;
         self.fetch_instruction();
         self.acc_reg().read_to_data();
         println!("{}", self.data_bus.get() as char);
-    }
-
-    /// special
-    pub fn enable_interrupt(&mut self) {}
-
-    /// special
-    pub fn disable_interrupt(&mut self) {}
-
-    /// special
-    pub fn halt(&mut self) {
-        self.halted = true;
-    }
-
-    /// special
-    pub fn no_op(&mut self) {}
-
-    fn reg16_code_from_bits(bits: u8) -> I8080RegisterCode16 {
-        use I8080RegisterCode16::*;
-        match bits {
-            0 => BC,
-            1 => DE,
-            2 => HL,
-            3 => SP,
-            _ => unreachable!(),
-        }
-    }
-
-    fn reg_code_from_bits(bits: u8) -> I8080RegisterCode {
-        use I8080RegisterCode::*;
-        match bits {
-            0 => B,
-            1 => C,
-            2 => D,
-            3 => E,
-            4 => H,
-            5 => L,
-            7 => Acc,
-            _ => unreachable!(),
-        }
-    }
-
-    fn condition_code_from_bits(bits: u8) -> I8080JumpCondition {
-        use I8080JumpCondition::*;
-        match bits {
-            0 => OnNonZero,
-            1 => OnZero,
-            2 => OnNonCarry,
-            3 => OnCarry,
-            4 => OnParityOdd,
-            5 => OnParityEven,
-            6 => OnPlus,
-            7 => OnMinus,
-            _ => unreachable!(),
-        }
     }
 
     pub fn execute(&mut self) {
@@ -881,8 +855,8 @@ impl I8080Console {
                 (1, 1) => self.ret(Anytime),
                 (2, 1) => self.ret(Anytime), // <= unspecified
                 (4, 1) => self.pop_reg16(PSW),
-                (5, 1) => self.pchl(),
-                (7, 1) => self.sphl(),
+                (5, 1) => self.load_reg16_from_reg16(PC, HL),
+                (7, 1) => self.load_reg16_from_reg16(SP, HL),
                 (0, 3) => self.jump_immediate(Anytime),
                 (1, 3) => self.jump_immediate(Anytime), // <= unspecified
                 (2, 3) => self.output(),
@@ -924,121 +898,78 @@ impl I8080Console {
     }
 }
 
-impl ProcDataRegisters<I8080RegisterCode> for I8080Console {
-    fn data_reg_read(&mut self, code: &I8080RegisterCode) {
-        self.code_reg_mut(*code).read_to_data()
-    }
-
-    fn data_reg_load(&mut self, code: &I8080RegisterCode) {
-        self.code_reg_mut(*code).load_from_data()
-    }
-}
-
-impl ProcAddressingRegisters<I8080RegisterCode16> for I8080Console {
-    fn addressing_reg_read(&mut self, code: &I8080RegisterCode16) {
-        self.code_reg16_read_to_address(*code);
-    }
-}
-
-impl ProcMemory for I8080Console {
+impl<M: Memory<Data = u8, Address = u16>> ProcMemory for I8080Console<M> {
     fn store(&mut self) {
         self.memory
+            .lock()
+            .unwrap()
             .write(self.address_bus.get(), self.data_bus.get())
     }
 
     fn fetch(&mut self) {
-        self.data_bus.set(self.memory.read(self.address_bus.get()));
+        self.data_bus
+            .set(self.memory.lock().unwrap().read(self.address_bus.get()));
     }
 }
 
-#[test]
-fn test() {
-    use I8080RegisterCode::*;
-    use I8080RegisterCode16::*;
-    let mut c = I8080Console::default();
-    let bus = Rc::clone(&c.data_bus);
-    bus.set(35);
-    c.code_reg_mut(B).load_from_data();
-    bus.set(0x12);
-    c.code_reg_mut(H).load_from_data();
-    bus.set(0x34);
-    c.code_reg_mut(L).load_from_data();
-    c.code_reg_mut(B).read_to_data();
-    c.code_reg16_read_to_address(HL);
-    c.store();
-    assert_eq!(c.memory.read(0x1234), 35);
+#[derive(Debug, Default)]
+pub struct I8080AllRAM {
+    proc: I8080Console<RamB8A16>,
 }
 
-#[test]
-fn movement() {
-    use I8080RegisterCode::*;
-    use I8080RegisterCode16::*;
-    let mut memory = RamB8A16::default();
-    memory.flash(&(0..=255u8).cycle().take(65535).collect::<Vec<_>>(), 0);
-    let mut c = I8080Console {
-        memory,
-        ..Default::default()
-    };
-    c.move_reg_immediate(B);
-    c.move_reg_to_reg(C, B);
-    assert_eq!(c.regs.get(&C).unwrap().reg.read(), 0);
-    c.move_reg_immediate(D);
-    c.move_reg_to_reg(E, D);
-    assert_eq!(c.regs.get(&E).unwrap().reg.read(), 1);
-    // load (0x0302) == 2
-    c.move_reg_direct(Acc);
-    assert_eq!(c.regs.get(&Acc).unwrap().reg.read(), 2);
-    // loadx (0x0504) == 0x0504
-    c.move_reg16_direct(HL);
-    assert_eq!(c.code_reg16_as_u16(HL), 0x0504);
+impl I8080AllRAM {
+    pub fn flash(&mut self, data: &[u8]) {
+        self.proc.memory.lock().unwrap().flash(data, 0);
+    }
+    pub fn run(&mut self) {
+        self.proc.run();
+    }
 }
 
-#[test]
-fn alu() {
-    use I8080AluCode::*;
-    use I8080RegisterCode::*;
-    use StatusFlag::*;
-    let mut c = I8080Console::default();
-    c.acc_reg().reg.load(20);
-    c.code_reg_mut(B).reg.load(30);
-    c.alu_with_reg(Add, B);
-    assert_eq!(c.acc_reg().reg.read(), 50);
-    c.acc_reg().reg.load(192);
-    c.code_reg_mut(B).reg.load(64);
-    c.alu_with_reg(Add, B);
-    assert_eq!(c.acc_reg().reg.read(), 0);
-    assert_eq!(
-        I8080Console::flag_collect(c.code_reg_mut(Flag).reg.read()),
-        Carry | Parity | Zero,
-    );
-    assert_eq!(c.code_reg_mut(Flag).reg.read(), 0b0100_0111);
-    c.flag_complement(Carry);
-    assert_eq!(
-        I8080Console::flag_collect(c.code_reg_mut(Flag).reg.read()),
-        Parity | Zero,
-    );
-    c.flag_complement(Carry);
-    assert_eq!(
-        I8080Console::flag_collect(c.code_reg_mut(Flag).reg.read()),
-        Carry | Parity | Zero,
-    );
-    c.flag_set(AuxiliaryCarry);
-    assert_eq!(
-        I8080Console::flag_collect(c.code_reg_mut(Flag).reg.read()),
-        AuxiliaryCarry | Carry | Parity | Zero,
-    );
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::RamB8A16;
+    use crate::processor::i8080::I8080Console;
+    use std::sync::{Arc, Mutex};
+    #[test]
+    fn movement() {
+        use crate::memory::RamB8A16;
+        use I8080RegisterCode::*;
+        use I8080RegisterCode16::*;
+        let mut row_memory = RamB8A16::default();
+        row_memory.flash(&(0..=255u8).cycle().take(65535).collect::<Vec<_>>(), 0);
+        let memory = Arc::new(Mutex::new(row_memory));
+        let mut c = I8080Console {
+            memory: Arc::clone(&memory),
+            ..Default::default()
+        };
+        c.move_reg_immediate(B);
+        c.move_reg_to_reg(C, B);
+        assert_eq!(c.regs.get(&C).unwrap().reg.read(), 0);
+        c.move_reg_immediate(D);
+        c.move_reg_to_reg(E, D);
+        assert_eq!(c.regs.get(&E).unwrap().reg.read(), 1);
+        // load (0x0302) == 2
+        c.move_reg_direct(Acc);
+        assert_eq!(c.regs.get(&Acc).unwrap().reg.read(), 2);
+        // loadx (0x0504) == 0x0504
+        c.move_reg16_direct(HL);
+        assert_eq!(c.code_reg16_as_u16(HL), 0x0504);
+    }
 
-#[test]
-fn run() {
-    use I8080RegisterCode16::PC;
-    let mut memory = RamB8A16::default();
-    memory.flash(&(0..=255u8).cycle().take(65535).collect::<Vec<_>>(), 0);
-    let mut c = I8080Console {
-        memory,
-        ..Default::default()
-    };
-    c.run();
-    println!("{:?}", c);
-    println!("{}", c.code_reg16_as_u16(PC));
+    #[test]
+    fn run() {
+        use I8080RegisterCode16::PC;
+        let mut row_memory = RamB8A16::default();
+        row_memory.flash(&(0..=255u8).cycle().take(65535).collect::<Vec<_>>(), 0);
+        let memory = Arc::new(Mutex::new(row_memory));
+        let mut c = I8080Console {
+            memory: Arc::clone(&memory),
+            ..Default::default()
+        };
+        c.run();
+        println!("{:?}", c);
+        println!("{}", c.code_reg16_as_u16(PC));
+    }
 }
